@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sl-smtp-proxy"
+version = "0.1.0"
+description = "Fail-closed SimpleLogin SMTP submission proxy scaffold"
+requires-python = ">=3.8"
+dependencies = [
+  "alias-routing-core",
+  "aiosmtpd>=1.4.6,<2",
+  "simplelogin-client",
+]
+
+[project.scripts]
+sl-smtp-proxy = "sl_smtp_proxy.main:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]

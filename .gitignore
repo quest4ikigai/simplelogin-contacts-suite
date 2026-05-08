@@ -1,0 +1,12 @@
+.env
+.env.production
+*.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.sqlite3
+apps/server-sync/__pycache__/
+deploy/docker/smtp-captures/
+docs/plans

@@ -1,0 +1,25 @@
+services:
+  smtp-proxy:
+    build:
+      context: ../..
+      dockerfile: apps/smtp-proxy/Dockerfile
+    container_name: simplelogin-smtp-proxy
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "2525:2525"
+    volumes:
+      - smtp_proxy_data:/data
+
+  fake-upstream:
+    image: python:3.12-slim
+    command: python /fake-smtp.py
+    volumes:
+      - ./fake-smtp.py:/fake-smtp.py:ro
+      - ./smtp-captures:/smtp-captures
+    ports:
+      - "1025:1025"
+
+
+volumes:
+  smtp_proxy_data:

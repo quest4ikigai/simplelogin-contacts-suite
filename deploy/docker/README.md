@@ -1,0 +1,255 @@
+# Docker Deployment
+
+This folder contains Docker deployment files for the apps in this repo. The SMTP
+proxy is the outgoing SMTP server for Apple Mail; IMAP should stay pointed
+directly at Proton Mail Bridge. The server-sync app optionally syncs
+SimpleLogin reverse aliases into Nextcloud Contacts.
+
+## Files
+
+- `docker-compose.smtp-proxy.yml`: SMTP proxy only.
+- `docker-compose.server-sync.yml`: Nextcloud contacts sync only.
+- `docker-compose.full.yml`: SMTP proxy plus the optional Nextcloud contacts sync.
+- `.env.smtp-proxy.example`: SMTP proxy environment template.
+- `.env.server-sync.example`: Nextcloud contacts sync environment template.
+- `caddy.example.Caddyfile`: note for future HTTP admin endpoints, not SMTP TLS.
+
+## Simple Step-By-Step Usage
+
+1. Copy the environment template:
+
+```bash
+cd deploy/docker
+cp .env.smtp-proxy.example .env
+```
+
+2. Edit `.env` and set at least:
+
+```dotenv
+SIMPLELOGIN_API_KEY=...
+SMTP_PROXY_USERNAME=...
+SMTP_PROXY_PASSWORD=...
+UPSTREAM_SMTP_HOST=host.docker.internal
+UPSTREAM_SMTP_PORT=1025
+UPSTREAM_SMTP_USERNAME=...
+UPSTREAM_SMTP_PASSWORD=...
+USER_MAILBOXES=user@example.com
+ALIAS_SUFFIX_DOMAINS=@example.net,@subdomain.simplelogin.example,.suffix@simplelogin.example
+```
+
+You do not need to list every SimpleLogin alias. The proxy discovers your owned
+aliases from the SimpleLogin API and stores them in the SQLite cache at
+`CACHE_PATH`. Use `MANUAL_SIMPLELOGIN_ALIASES` only for temporary local
+overrides.
+
+3. Keep this enabled for the first test:
+
+```dotenv
+SMTP_PROXY_DRY_RUN=true
+```
+
+4. Start the proxy:
+
+```bash
+docker compose -f docker-compose.smtp-proxy.yml up -d --build
+docker logs -f simplelogin-smtp-proxy
+```
+
+5. Send a dry-run test message through the proxy. The message should be rejected
+   after a redacted transform summary is logged.
+
+For manual alias selection today, place exactly one alias in `To`, `Cc`, or `Bcc`:
+
+```text
+Cc: orders@example.net
+```
+
+The proxy matches the alias against `ALIAS_SUFFIX_DOMAINS` or the discovered owned-alias cache, verifies it with SimpleLogin, uses it for reverse-alias routing, and strips that alias recipient before forwarding. If two distinct aliases appear anywhere in the submitted recipients, the proxy rejects the message.
+
+Supported suffix examples:
+
+```dotenv
+ALIAS_SUFFIX_DOMAINS=@example.net,@subdomain.simplelogin.example,.suffix@simplelogin.example
+```
+
+6. When the dry-run log shows the expected selected alias and rewritten
+   recipient count, switch only for a controlled test:
+
+```dotenv
+SMTP_PROXY_DRY_RUN=false
+```
+
+7. Restart and send to a disposable/test recipient:
+
+```bash
+docker compose -f docker-compose.smtp-proxy.yml up -d
+```
+
+8. After the test, inspect logs and confirm the upstream recipient was a
+   SimpleLogin reverse alias, not the original external address.
+
+## Deployment Modes
+
+### Mode A: Same Mac As Apple Mail
+
+```text
+Apple Mail -> localhost:2525 -> SMTP proxy -> Proton Bridge SMTP
+```
+
+Use this for first tests. Bind to localhost if Docker networking allows it:
+
+```dotenv
+SMTP_PROXY_HOST=127.0.0.1
+SMTP_PROXY_PORT=2525
+SMTP_PROXY_REQUIRE_AUTH=true
+SMTP_PROXY_REQUIRE_TLS=false
+```
+
+If Docker Desktop needs port publishing on all interfaces, keep your macOS
+firewall closed to untrusted networks and use strong SMTP credentials.
+
+### Mode B: Home Server Over VPN
+
+```text
+Mac/iPhone/iPad -> Tailscale/WireGuard -> home server proxy -> Proton Bridge SMTP
+```
+
+Recommended for daily cross-device use. Keep the proxy reachable only on your
+VPN interface or trusted LAN:
+
+```dotenv
+SMTP_PROXY_HOST=0.0.0.0
+SMTP_PROXY_REQUIRE_AUTH=true
+SMTP_PROXY_REQUIRE_TLS=false
+```
+
+Use Tailscale/WireGuard ACLs or firewall rules so the port is not public.
+
+### Mode C: Public TLS Endpoint
+
+Use this only if VPN is not practical.
+
+Requirements before public exposure:
+
+- TLS with a valid certificate.
+- SMTP AUTH enabled with a strong password.
+- Failed-auth throttling or firewall-level rate limiting.
+- Monitoring for auth failures.
+- `ALLOW_DIRECT_EXTERNAL_SEND=false`.
+
+The current proxy refuses startup when `SMTP_PROXY_REQUIRE_TLS=true` because TLS
+certificate configuration is not implemented yet. Do not expose this publicly
+until that is completed or a TCP-capable TLS terminator is configured correctly.
+
+## Apple Mail On macOS
+
+Keep incoming mail unchanged:
+
+- Incoming/IMAP server: Proton Mail Bridge IMAP.
+
+Change only outgoing mail:
+
+1. Open Mail settings.
+2. Go to Accounts.
+3. Select the Proton account.
+4. Open Server Settings.
+5. Keep Incoming Mail Server pointed at Proton Bridge IMAP.
+6. Set Outgoing Mail Server to a custom SMTP server.
+7. Hostname: proxy host, such as `127.0.0.1` or your VPN hostname.
+8. Port: `2525` unless changed.
+9. Username/password: `SMTP_PROXY_USERNAME` and `SMTP_PROXY_PASSWORD`.
+10. TLS: off for localhost/VPN-only tests; on only after proxy TLS support or a
+    correct TCP TLS terminator is configured.
+
+Alias selection options:
+
+- `X-SimpleLogin-Alias` from a future helper.
+- Exactly one alias in `To`, `Cc`, or `Bcc`, such as `Cc: orders@example.net`, when its suffix is listed in `ALIAS_SUFFIX_DOMAINS` or it is discovered from SimpleLogin.
+- Single `To` alias cover recipient for anonymized Bcc sends, such as
+  `To: announcements@example.net` plus external recipients in Bcc.
+
+If two distinct aliases appear anywhere in the submitted recipients, the proxy rejects the message.
+
+For the cover-recipient flow, the proxy preserves the alias in the visible `To`
+header, removes that alias from the SMTP envelope, strips `Bcc`, and forwards
+only the rewritten SimpleLogin reverse aliases for the Bcc recipients.
+
+Owned aliases for reply-all cleanup are discovered from SimpleLogin
+automatically; do not maintain a giant comma-separated alias list in `.env`.
+
+## iOS And iPadOS Mail
+
+Use a trusted network path, preferably Tailscale or WireGuard.
+
+1. Open Settings.
+2. Go to Apps, then Mail, then Mail Accounts. Labels vary by iOS version.
+3. Select the Proton account.
+4. Open SMTP / Outgoing Mail Server.
+5. Add or edit the primary SMTP server.
+6. Hostname: proxy VPN hostname or trusted LAN hostname.
+7. Port: `2525` unless changed.
+8. Username/password: `SMTP_PROXY_USERNAME` and `SMTP_PROXY_PASSWORD`.
+9. Use SSL/TLS only after TLS support is configured.
+10. Keep incoming IMAP pointed directly at Proton Bridge or your existing
+    incoming-mail setup.
+
+For alias selection on iOS, place exactly one alias in `To`, `Cc`, or `Bcc`, such as `Cc: orders@example.net`, when its suffix is listed in `ALIAS_SUFFIX_DOMAINS` or it is discovered from SimpleLogin.
+
+The proxy consumes and strips the alias recipient before forwarding, except for the single-`To` cover-recipient flow where the visible `To` alias is preserved and removed only from the SMTP envelope.
+
+## Safe Defaults
+
+Recommended values:
+
+```dotenv
+SMTP_PROXY_REQUIRE_AUTH=true
+SMTP_PROXY_DRY_RUN=true
+FAIL_CLOSED=true
+REWRITE_HEADERS=true
+REWRITE_ENVELOPE=true
+KEEP_UNKNOWN_SIMPLELOGIN_ADDRESSES=true
+STRIP_OWN_ALIASES=true
+STRIP_OWN_MAILBOXES=true
+ALLOW_DIRECT_EXTERNAL_SEND=false
+LOG_REDACT_ADDRESSES=true
+LOG_MESSAGE_BODY=false
+LOG_SUBJECT=false
+```
+
+Do not run an unauthenticated public SMTP relay. Do not set
+`ALLOW_DIRECT_EXTERNAL_SEND=true` for normal use.
+
+## Useful Commands
+
+Start or rebuild:
+
+```bash
+docker compose -f docker-compose.smtp-proxy.yml up -d --build
+```
+
+View logs:
+
+```bash
+docker logs -f simplelogin-smtp-proxy
+```
+
+Stop:
+
+```bash
+docker compose -f docker-compose.smtp-proxy.yml down
+```
+
+Run the contacts sync only:
+
+```bash
+cp .env.server-sync.example .env
+docker compose -f docker-compose.server-sync.yml up -d --build
+```
+
+Run the full example with the SMTP proxy plus contacts sync:
+
+```bash
+cp .env.smtp-proxy.example .env
+# Append the server-sync settings you need from .env.server-sync.example.
+docker compose -f docker-compose.full.yml up -d --build
+```

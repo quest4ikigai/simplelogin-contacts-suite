@@ -1,0 +1,17 @@
+services:
+  smtp-proxy:
+    extends:
+      file: docker-compose.smtp-proxy.yml
+      service: smtp-proxy
+
+  simplelogin-nextcloud-contacts:
+    build:
+      context: ../../apps/server-sync
+      dockerfile: Dockerfile
+    container_name: simplelogin-nextcloud-contacts
+    restart: unless-stopped
+    env_file: .env
+    command: ["python", "/app/sync.py"]
+
+volumes:
+  smtp_proxy_data:

@@ -1,0 +1,10 @@
+services:
+  simplelogin-nextcloud-contacts:
+    build: ../../apps/server-sync
+    container_name: simplelogin-nextcloud-contacts
+    restart: unless-stopped
+    env_file: .env
+    # To use REVERSE_ALIAS_EXCLUDE_REGEX_FILE, mount your host file into the container.
+    # volumes:
+    #   - ./reverse-alias-exclude-regex.txt:/app/reverse-alias-exclude-regex.txt:ro
+    command: ["python", "/app/sync.py"]

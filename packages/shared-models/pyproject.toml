@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shared-models"
+version = "0.1.0"
+description = "Shared config and email helpers for SimpleLogin Alias Suite"
+requires-python = ">=3.8"
+
+[tool.setuptools.packages.find]
+where = ["src"]
