@@ -1,7 +1,6 @@
-# SimpleLogin Alias Suite
+# SimpleLogin Contacts Suite
 
-This repo is evolving from a SimpleLogin-to-Nextcloud contacts sync MVP into a
-small suite for using SimpleLogin aliases safely from Apple Mail.
+This repo is a small suite of tools for using SimpleLogin aliases safely from Apple Mail.
 
 The central feature is an outbound SMTP submission proxy:
 
