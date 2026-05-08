@@ -6,7 +6,11 @@ build-backend = "setuptools.build_meta"
 name = "simplelogin-client"
 version = "0.1.0"
 description = "SimpleLogin API wrapper for alias and reverse-alias management"
+license = { file = "LICENSE" }
 requires-python = ">=3.8"
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+]
 dependencies = ["requests>=2.31"]
 
 [tool.setuptools.packages.find]
