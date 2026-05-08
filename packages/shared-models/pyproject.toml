@@ -6,7 +6,11 @@ build-backend = "setuptools.build_meta"
 name = "shared-models"
 version = "0.1.0"
 description = "Shared config and email helpers for SimpleLogin Alias Suite"
+license = { file = "LICENSE" }
 requires-python = ">=3.8"
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

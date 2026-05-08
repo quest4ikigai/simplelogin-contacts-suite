@@ -6,7 +6,11 @@ build-backend = "setuptools.build_meta"
 name = "alias-routing-core"
 version = "0.1.0"
 description = "Pure recipient classification and transform planning for SimpleLogin alias routing"
+license = { file = "LICENSE" }
 requires-python = ">=3.8"
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -88,4 +88,7 @@ forwarding messages.
 
 ## License
 
-MIT
+Licensed under the MIT License. See [LICENSE](LICENSE).
+
+This project is unofficial and is not affiliated with, endorsed by, or
+sponsored by SimpleLogin, Proton, Nextcloud, or Apple.

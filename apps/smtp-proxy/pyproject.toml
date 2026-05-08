@@ -6,7 +6,11 @@ build-backend = "setuptools.build_meta"
 name = "sl-smtp-proxy"
 version = "0.1.0"
 description = "Fail-closed SimpleLogin SMTP submission proxy scaffold"
+license = { file = "LICENSE" }
 requires-python = ">=3.8"
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+]
 dependencies = [
   "alias-routing-core",
   "aiosmtpd>=1.4.6,<2",
