@@ -38,6 +38,10 @@ class SmtpProxyConfig:
     username: str = "user"
     password: str = "change-me"
     require_tls: bool = False
+    tls_mode: str = "starttls"
+    tls_cert_file: str = ""
+    tls_key_file: str = ""
+    auth_login_enabled: bool = True
     max_message_bytes: int = 25 * 1024 * 1024
     dry_run: bool = True
 
@@ -102,6 +106,10 @@ def load_config_from_env() -> SmtpProxyConfig:
         username=os.environ.get("SMTP_PROXY_USERNAME", "user"),
         password=os.environ.get("SMTP_PROXY_PASSWORD", "change-me"),
         require_tls=env_bool("SMTP_PROXY_REQUIRE_TLS", False),
+        tls_mode=os.environ.get("SMTP_PROXY_TLS_MODE", "starttls"),
+        tls_cert_file=os.environ.get("SMTP_PROXY_TLS_CERT_FILE", ""),
+        tls_key_file=os.environ.get("SMTP_PROXY_TLS_KEY_FILE", ""),
+        auth_login_enabled=env_bool("SMTP_PROXY_AUTH_LOGIN_ENABLED", True),
         max_message_bytes=env_int("SMTP_PROXY_MAX_MESSAGE_BYTES", 25 * 1024 * 1024),
         dry_run=env_bool("SMTP_PROXY_DRY_RUN", True),
         upstream_host=os.environ.get("UPSTREAM_SMTP_HOST", "host.docker.internal"),

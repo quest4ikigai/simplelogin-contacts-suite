@@ -8,7 +8,7 @@ Current behavior:
 
 1. Accepts local SMTP submissions.
 2. Uses `aiosmtpd` for SMTP protocol handling.
-3. Optionally requires SMTP AUTH PLAIN.
+3. Optionally requires SMTP AUTH PLAIN or LOGIN.
 4. Parses SMTP envelope recipients and MIME `To`, `Cc`, and `Bcc` recipients.
 5. Selects exactly one SimpleLogin alias from `X-SimpleLogin-Alias` or any `To`, `Cc`, or `Bcc` recipient.
 6. Resolves external recipients to SimpleLogin reverse aliases using the local
@@ -29,6 +29,20 @@ python -m sl_smtp_proxy.main
 Forwarding is disabled by default via `SMTP_PROXY_DRY_RUN=true`. Leave dry-run
 enabled until fake-upstream or disposable-account tests prove your configuration
 rewrites every external recipient as expected.
+
+For remote mail clients, configure inbound proxy TLS with:
+
+```dotenv
+SMTP_PROXY_REQUIRE_TLS=true
+SMTP_PROXY_TLS_MODE=starttls
+SMTP_PROXY_TLS_CERT_FILE=/certs/proxy.crt
+SMTP_PROXY_TLS_KEY_FILE=/certs/proxy.key
+SMTP_PROXY_AUTH_LOGIN_ENABLED=true
+```
+
+`SMTP_PROXY_TLS_MODE=starttls` advertises STARTTLS after `EHLO`. If a client
+starts encrypted TLS immediately on connect, use `SMTP_PROXY_TLS_MODE=implicit`
+on a dedicated port instead.
 
 For normal sends and reply-all cleanup, put exactly one alias in `To`, `Cc`, or `Bcc`; the proxy uses it as the selected sending alias and rejects if two distinct aliases appear. For anonymized Bcc sends, a single alias in `To` can also act as the visible cover recipient:
 
