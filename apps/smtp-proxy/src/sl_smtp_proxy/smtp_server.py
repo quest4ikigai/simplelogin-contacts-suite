@@ -4,6 +4,7 @@ import asyncio
 import hmac
 import logging
 import socket
+import ssl
 from typing import Optional
 
 from aiosmtpd.controller import Controller
@@ -17,6 +18,7 @@ from .reverse_alias_resolver import resolver_from_config
 
 
 LOGGER = logging.getLogger(__name__)
+TLS_MODES = {"starttls", "implicit"}
 
 
 class SmtpProxyHandler:
@@ -109,23 +111,25 @@ class SmtpProxyServer:
         return int(sockets[0].getsockname()[1])
 
     async def start(self) -> None:
-        if self.config.require_tls:
-            raise RuntimeError(
-                "SMTP_PROXY_REQUIRE_TLS is set, but TLS certificates are not configured yet."
-            )
+        controller_ssl_context, smtp_tls_context, require_starttls, auth_require_tls = (
+            _tls_settings(self.config)
+        )
 
         self._controller = Controller(
             self.handler,
             hostname=self.config.host,
             port=_resolve_listen_port(self.config.host, self.config.port),
+            ssl_context=controller_ssl_context,
             ready_timeout=5.0,
             server_hostname="simplelogin-smtp-proxy",
+            tls_context=smtp_tls_context,
+            require_starttls=require_starttls,
             data_size_limit=self.config.max_message_bytes,
             decode_data=False,
             auth_required=self.config.require_auth,
-            auth_require_tls=False,
+            auth_require_tls=auth_require_tls,
             authenticator=_authenticator(self.config) if self.config.require_auth else None,
-            auth_exclude_mechanism=["LOGIN"],
+            auth_exclude_mechanism=_excluded_auth_mechanisms(self.config),
             command_call_limit={"RCPT": 500, "NOOP": 20, "RSET": 20, "*": 100},
         )
         self._controller.start()
@@ -166,6 +170,51 @@ def _authenticator(config: SmtpProxyConfig):
         )
 
     return authenticate
+
+
+def _excluded_auth_mechanisms(config: SmtpProxyConfig):
+    if config.auth_login_enabled:
+        return []
+    return ["LOGIN"]
+
+
+def _tls_settings(config: SmtpProxyConfig):
+    tls_context = _tls_context(config)
+    if tls_context is None:
+        return None, None, False, False
+
+    tls_mode = config.tls_mode.strip().lower()
+    if tls_mode not in TLS_MODES:
+        raise RuntimeError(
+            "SMTP_PROXY_TLS_MODE must be 'starttls' or 'implicit'."
+        )
+
+    if tls_mode == "implicit":
+        # aiosmtpd's auth_require_tls only recognizes STARTTLS upgrades. With
+        # implicit TLS, the socket is encrypted before SMTP handling begins.
+        return tls_context, None, False, False
+
+    return None, tls_context, config.require_tls, True
+
+
+def _tls_context(config: SmtpProxyConfig) -> Optional[ssl.SSLContext]:
+    tls_requested = config.require_tls or bool(config.tls_cert_file or config.tls_key_file)
+    if not tls_requested:
+        return None
+
+    if not config.tls_cert_file or not config.tls_key_file:
+        raise RuntimeError(
+            "SMTP proxy TLS requires both SMTP_PROXY_TLS_CERT_FILE and SMTP_PROXY_TLS_KEY_FILE."
+        )
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    if hasattr(ssl, "TLSVersion"):
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(
+        certfile=config.tls_cert_file,
+        keyfile=config.tls_key_file,
+    )
+    return context
 
 
 def _resolve_listen_port(host: str, port: int) -> int:

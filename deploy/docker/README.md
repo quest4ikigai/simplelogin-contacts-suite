@@ -29,6 +29,10 @@ cp .env.smtp-proxy.example .env
 SIMPLELOGIN_API_KEY=...
 SMTP_PROXY_USERNAME=...
 SMTP_PROXY_PASSWORD=...
+SMTP_PROXY_REQUIRE_TLS=true
+SMTP_PROXY_TLS_MODE=starttls
+SMTP_PROXY_TLS_CERT_FILE=/certs/proxy.crt
+SMTP_PROXY_TLS_KEY_FILE=/certs/proxy.key
 UPSTREAM_SMTP_HOST=host.docker.internal
 UPSTREAM_SMTP_PORT=1025
 UPSTREAM_SMTP_USERNAME=...
@@ -120,10 +124,16 @@ VPN interface or trusted LAN:
 ```dotenv
 SMTP_PROXY_HOST=0.0.0.0
 SMTP_PROXY_REQUIRE_AUTH=true
-SMTP_PROXY_REQUIRE_TLS=false
+SMTP_PROXY_REQUIRE_TLS=true
+SMTP_PROXY_TLS_MODE=starttls
+SMTP_PROXY_TLS_CERT_FILE=/certs/proxy.crt
+SMTP_PROXY_TLS_KEY_FILE=/certs/proxy.key
 ```
 
-Use Tailscale/WireGuard ACLs or firewall rules so the port is not public.
+Use Tailscale/WireGuard ACLs or firewall rules so the port is not public. If
+Apple Mail sends encrypted bytes immediately on connect instead of issuing
+`EHLO` and `STARTTLS`, switch this listener to `SMTP_PROXY_TLS_MODE=implicit`
+or run a second dedicated implicit-TLS listener on a separate port.
 
 ### Mode C: Public TLS Endpoint
 
@@ -137,9 +147,9 @@ Requirements before public exposure:
 - Monitoring for auth failures.
 - `ALLOW_DIRECT_EXTERNAL_SEND=false`.
 
-The current proxy refuses startup when `SMTP_PROXY_REQUIRE_TLS=true` because TLS
-certificate configuration is not implemented yet. Do not expose this publicly
-until that is completed or a TCP-capable TLS terminator is configured correctly.
+The proxy supports inbound STARTTLS and implicit TLS with configured certificate
+and key files. Do not expose it publicly unless the certificate is valid for the
+client-facing hostname and firewall/rate-limit controls are in place.
 
 ## Apple Mail On macOS
 
@@ -158,8 +168,9 @@ Change only outgoing mail:
 7. Hostname: proxy host, such as `127.0.0.1` or your VPN hostname.
 8. Port: `2525` unless changed.
 9. Username/password: `SMTP_PROXY_USERNAME` and `SMTP_PROXY_PASSWORD`.
-10. TLS: off for localhost/VPN-only tests; on only after proxy TLS support or a
-    correct TCP TLS terminator is configured.
+10. TLS: off only for same-host localhost tests. For remote clients, enable
+    TLS/SSL and set the proxy to `SMTP_PROXY_TLS_MODE=starttls` or
+    `SMTP_PROXY_TLS_MODE=implicit`, whichever matches the client behavior.
 
 Alias selection options:
 
@@ -189,7 +200,7 @@ Use a trusted network path, preferably Tailscale or WireGuard.
 6. Hostname: proxy VPN hostname or trusted LAN hostname.
 7. Port: `2525` unless changed.
 8. Username/password: `SMTP_PROXY_USERNAME` and `SMTP_PROXY_PASSWORD`.
-9. Use SSL/TLS only after TLS support is configured.
+9. Use SSL/TLS with a proxy certificate trusted by the device.
 10. Keep incoming IMAP pointed directly at Proton Bridge or your existing
     incoming-mail setup.
 
@@ -204,6 +215,7 @@ Recommended values:
 ```dotenv
 SMTP_PROXY_REQUIRE_AUTH=true
 SMTP_PROXY_DRY_RUN=true
+SMTP_PROXY_AUTH_LOGIN_ENABLED=true
 FAIL_CLOSED=true
 REWRITE_HEADERS=true
 REWRITE_ENVELOPE=true

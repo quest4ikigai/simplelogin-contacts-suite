@@ -3,8 +3,12 @@ import base64
 from email import policy
 from email.parser import BytesParser
 import os
+import shutil
 import socket
+import ssl
+import subprocess
 import sys
+import tempfile
 import unittest
 import warnings
 from email.message import EmailMessage
@@ -52,6 +56,46 @@ def free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+
+def make_test_cert(test_case):
+    openssl = shutil.which("openssl")
+    if not openssl:
+        test_case.skipTest("openssl is required for TLS tests")
+
+    tempdir = tempfile.TemporaryDirectory()
+    test_case.addCleanup(tempdir.cleanup)
+    cert_file = os.path.join(tempdir.name, "cert.pem")
+    key_file = os.path.join(tempdir.name, "key.pem")
+    subprocess.run(
+        [
+            openssl,
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            key_file,
+            "-out",
+            cert_file,
+            "-days",
+            "1",
+            "-subj",
+            "/CN=127.0.0.1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    return cert_file, key_file
+
+
+def insecure_client_tls_context():
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
 
 
 def submit_message(port, msg, rcpt_tos, mail_from="sender@example.com"):
@@ -583,12 +627,171 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await auth_server.stop()
 
+    async def test_auth_login_accepts_configured_credentials(self):
+        auth_server = SmtpProxyServer(
+            SmtpProxyConfig(
+                host="127.0.0.1",
+                port=0,
+                require_auth=True,
+                username="user",
+                password="pass",
+            )
+        )
+        await auth_server.start()
+        try:
+            def authenticate():
+                with socket.create_connection(("127.0.0.1", auth_server.port), timeout=2) as sock:
+                    fileobj = sock.makefile("rwb", buffering=0)
+                    read_smtp_response(fileobj)
+                    send_smtp_line(fileobj, "EHLO test.local")
+                    read_smtp_response(fileobj)
+                    send_smtp_line(fileobj, "AUTH LOGIN")
+                    self.assertEqual(read_smtp_response(fileobj)[0], 334)
+                    send_smtp_line(fileobj, base64.b64encode(b"user").decode("ascii"))
+                    self.assertEqual(read_smtp_response(fileobj)[0], 334)
+                    send_smtp_line(fileobj, base64.b64encode(b"pass").decode("ascii"))
+                    return read_smtp_response(fileobj)
+
+            result = await asyncio.get_running_loop().run_in_executor(None, authenticate)
+
+            self.assertEqual(result[0], 235)
+        finally:
+            await auth_server.stop()
+
+    async def test_auth_login_can_be_disabled(self):
+        auth_server = SmtpProxyServer(
+            SmtpProxyConfig(
+                host="127.0.0.1",
+                port=0,
+                require_auth=True,
+                username="user",
+                password="pass",
+                auth_login_enabled=False,
+            )
+        )
+        await auth_server.start()
+        try:
+            def authenticate():
+                with socket.create_connection(("127.0.0.1", auth_server.port), timeout=2) as sock:
+                    fileobj = sock.makefile("rwb", buffering=0)
+                    read_smtp_response(fileobj)
+                    send_smtp_line(fileobj, "EHLO test.local")
+                    _, ehlo = read_smtp_response(fileobj)
+                    send_smtp_line(fileobj, "AUTH LOGIN")
+                    return ehlo, read_smtp_response(fileobj)
+
+            ehlo, result = await asyncio.get_running_loop().run_in_executor(None, authenticate)
+
+            self.assertIn("AUTH PLAIN", ehlo)
+            self.assertNotIn("LOGIN", ehlo)
+            self.assertEqual(result[0], 504)
+        finally:
+            await auth_server.stop()
+
+    async def test_starttls_requires_tls_before_auth_and_accepts_login_after_upgrade(self):
+        cert_file, key_file = make_test_cert(self)
+        auth_server = SmtpProxyServer(
+            SmtpProxyConfig(
+                host="127.0.0.1",
+                port=0,
+                require_auth=True,
+                require_tls=True,
+                tls_mode="starttls",
+                tls_cert_file=cert_file,
+                tls_key_file=key_file,
+                username="user",
+                password="pass",
+            )
+        )
+        await auth_server.start()
+        try:
+            def authenticate():
+                sock = socket.create_connection(("127.0.0.1", auth_server.port), timeout=2)
+                try:
+                    fileobj = sock.makefile("rwb", buffering=0)
+                    read_smtp_response(fileobj)
+                    send_smtp_line(fileobj, "EHLO test.local")
+                    _, plain_ehlo = read_smtp_response(fileobj)
+                    self.assertIn("STARTTLS", plain_ehlo)
+                    self.assertNotIn("AUTH", plain_ehlo)
+
+                    send_smtp_line(fileobj, "AUTH LOGIN")
+                    self.assertIn(read_smtp_response(fileobj)[0], {530, 538})
+
+                    send_smtp_line(fileobj, "STARTTLS")
+                    self.assertEqual(read_smtp_response(fileobj)[0], 220)
+                    sock = insecure_client_tls_context().wrap_socket(
+                        sock,
+                        server_hostname="127.0.0.1",
+                    )
+                    fileobj = sock.makefile("rwb", buffering=0)
+                    send_smtp_line(fileobj, "EHLO test.local")
+                    _, tls_ehlo = read_smtp_response(fileobj)
+                    self.assertIn("AUTH LOGIN PLAIN", tls_ehlo)
+
+                    send_smtp_line(fileobj, "AUTH LOGIN")
+                    self.assertEqual(read_smtp_response(fileobj)[0], 334)
+                    send_smtp_line(fileobj, base64.b64encode(b"user").decode("ascii"))
+                    self.assertEqual(read_smtp_response(fileobj)[0], 334)
+                    send_smtp_line(fileobj, base64.b64encode(b"pass").decode("ascii"))
+                    return read_smtp_response(fileobj)
+                finally:
+                    sock.close()
+
+            result = await asyncio.get_running_loop().run_in_executor(None, authenticate)
+
+            self.assertEqual(result[0], 235)
+        finally:
+            await auth_server.stop()
+
+    async def test_implicit_tls_accepts_login_on_encrypted_socket(self):
+        cert_file, key_file = make_test_cert(self)
+        auth_server = SmtpProxyServer(
+            SmtpProxyConfig(
+                host="127.0.0.1",
+                port=0,
+                require_auth=True,
+                require_tls=True,
+                tls_mode="implicit",
+                tls_cert_file=cert_file,
+                tls_key_file=key_file,
+                username="user",
+                password="pass",
+            )
+        )
+        await auth_server.start()
+        try:
+            def authenticate():
+                raw_sock = socket.create_connection(("127.0.0.1", auth_server.port), timeout=2)
+                with insecure_client_tls_context().wrap_socket(
+                    raw_sock,
+                    server_hostname="127.0.0.1",
+                ) as sock:
+                    fileobj = sock.makefile("rwb", buffering=0)
+                    read_smtp_response(fileobj)
+                    send_smtp_line(fileobj, "EHLO test.local")
+                    _, ehlo = read_smtp_response(fileobj)
+                    self.assertNotIn("STARTTLS", ehlo)
+                    self.assertIn("AUTH LOGIN PLAIN", ehlo)
+                    send_smtp_line(fileobj, "AUTH LOGIN")
+                    self.assertEqual(read_smtp_response(fileobj)[0], 334)
+                    send_smtp_line(fileobj, base64.b64encode(b"user").decode("ascii"))
+                    self.assertEqual(read_smtp_response(fileobj)[0], 334)
+                    send_smtp_line(fileobj, base64.b64encode(b"pass").decode("ascii"))
+                    return read_smtp_response(fileobj)
+
+            result = await asyncio.get_running_loop().run_in_executor(None, authenticate)
+
+            self.assertEqual(result[0], 235)
+        finally:
+            await auth_server.stop()
+
     async def test_require_tls_refuses_start_until_tls_is_configured(self):
         tls_server = SmtpProxyServer(
             SmtpProxyConfig(host="127.0.0.1", port=0, require_auth=True, require_tls=True)
         )
 
-        with self.assertRaisesRegex(RuntimeError, "TLS certificates are not configured"):
+        with self.assertRaisesRegex(RuntimeError, "SMTP_PROXY_TLS_CERT_FILE"):
             await tls_server.start()
 
 
