@@ -17,7 +17,13 @@ from alias_routing_core import normalize_email_address
 from .config import SmtpProxyConfig
 from .forwarder import UpstreamForwardingError, UpstreamSmtpForwarder
 from .logging import audit_event, plan_audit_fields, plan_summary, redact_address, safe_reason
-from .message_transform import apply_transform, build_plan_for_message, transformed_envelope_recipients
+from .message_transform import (
+    apply_transform,
+    build_plan_for_message,
+    parse_message,
+    transformed_envelope_recipients,
+)
+from .mime_sender_validation import validate_mime_sender
 from .reverse_alias_resolver import resolver_from_config
 from .safety_verifier import verify_post_transform_safety, visible_recipient_count
 
@@ -101,6 +107,23 @@ class SmtpProxyHandler:
             data = content.encode("utf-8", errors="replace")
         else:
             data = bytes(content or b"")
+
+        parsed_message = parse_message(data)
+        mime_sender_validation = validate_mime_sender(parsed_message, self.config)
+        if not mime_sender_validation.accepted:
+            LOGGER.info(
+                "audit %s",
+                audit_event(
+                    "smtp_mime_sender_rejected",
+                    peer=_peer_host(session),
+                    policy="mime_sender_validation",
+                    header=mime_sender_validation.header,
+                    reason=mime_sender_validation.reason,
+                    from_count=mime_sender_validation.from_count,
+                    sender_count=mime_sender_validation.sender_count,
+                ),
+            )
+            return "550 MIME sender address is not allowed by SimpleLogin proxy policy"
 
         extra_simplelogin_aliases = set()
         if self.config.strip_own_aliases and hasattr(self.reverse_alias_resolver, "owned_alias_emails"):

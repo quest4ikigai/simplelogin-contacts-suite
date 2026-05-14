@@ -384,6 +384,128 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await sender_server.stop()
 
+    async def test_mime_from_outside_user_mailboxes_rejects_before_simplelogin_and_upstream(self):
+        fake_simplelogin = FakeSimpleLoginHttpServer(self)
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        proxy = SmtpProxyServer(
+            SmtpProxyConfig(
+                simplelogin_base_url=fake_simplelogin.url,
+                simplelogin_api_key="test-api-key",
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+                user_mailboxes={"sender@example.com"},
+                alias_suffix_domains={"@example.net"},
+                cache_path=os.path.join(tempdir.name, "cache.sqlite3"),
+            ),
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "intruder@example.com"
+            msg["To"] = "Alice <alice@example.com>"
+            msg["Bcc"] = "orders@example.net"
+            msg.set_content("private body")
+
+            with self.assertLogs("sl_smtp_proxy.smtp_server", level="INFO") as captured:
+                result = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    submit_message,
+                    proxy.port,
+                    msg,
+                    ["alice@example.com", "orders@example.net"],
+                    "sender@example.com",
+                )
+
+            self.assertEqual(result[0], 550)
+            self.assertIn("MIME sender address is not allowed", result[1])
+            self.assertEqual(fake_simplelogin.requests, [])
+            self.assertEqual(upstream_handler.messages, [])
+            self.assertIsNone(proxy.last_plan)
+            audit_payloads = [
+                json.loads(line.split("audit ", 1)[1])
+                for line in captured.output
+                if "audit " in line
+            ]
+            self.assertEqual(audit_payloads[0]["event"], "smtp_mime_sender_rejected")
+            self.assertEqual(audit_payloads[0]["header"], "from")
+            self.assertEqual(audit_payloads[0]["reason"], "from_not_allowed")
+            self.assertNotIn("intruder@example.com", "\n".join(captured.output))
+            self.assertNotIn("private body", "\n".join(captured.output))
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
+    async def test_mime_sender_outside_user_mailboxes_rejects_before_simplelogin_and_upstream(self):
+        fake_simplelogin = FakeSimpleLoginHttpServer(self)
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        proxy = SmtpProxyServer(
+            SmtpProxyConfig(
+                simplelogin_base_url=fake_simplelogin.url,
+                simplelogin_api_key="test-api-key",
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+                user_mailboxes={"sender@example.com"},
+                alias_suffix_domains={"@example.net"},
+                cache_path=os.path.join(tempdir.name, "cache.sqlite3"),
+            ),
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["Sender"] = "intruder@example.com"
+            msg["To"] = "Alice <alice@example.com>"
+            msg["Bcc"] = "orders@example.net"
+            msg.set_content("private body")
+
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                submit_message,
+                proxy.port,
+                msg,
+                ["alice@example.com", "orders@example.net"],
+                "sender@example.com",
+            )
+
+            self.assertEqual(result[0], 550)
+            self.assertIn("MIME sender address is not allowed", result[1])
+            self.assertEqual(fake_simplelogin.requests, [])
+            self.assertEqual(upstream_handler.messages, [])
+            self.assertIsNone(proxy.last_plan)
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
     async def test_message_over_max_size_is_rejected_before_planning(self):
         size_server = SmtpProxyServer(
             SmtpProxyConfig(
