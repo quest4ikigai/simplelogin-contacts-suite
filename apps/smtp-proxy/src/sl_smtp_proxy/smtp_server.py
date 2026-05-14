@@ -15,6 +15,7 @@ from aiosmtpd.smtp import AuthResult, LoginPassword, SMTP
 from alias_routing_core import normalize_email_address
 
 from .config import SmtpProxyConfig
+from .config_validation import validate_startup_config
 from .forwarder import UpstreamForwardingError, UpstreamSmtpForwarder
 from .logging import audit_event, plan_audit_fields, plan_summary, redact_address, safe_reason
 from .message_transform import (
@@ -282,6 +283,7 @@ class SmtpProxyServer:
         return int(sockets[0].getsockname()[1])
 
     async def start(self) -> None:
+        validate_startup_config(self.config)
         controller_ssl_context, smtp_tls_context, require_starttls, auth_require_tls = (
             _tls_settings(self.config)
         )

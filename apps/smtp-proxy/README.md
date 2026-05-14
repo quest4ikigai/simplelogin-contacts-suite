@@ -23,12 +23,18 @@ Run locally from this directory:
 
 ```bash
 python -m pip install -e ../../packages/alias-routing-core -e ../../packages/simplelogin-client -e .
-python -m sl_smtp_proxy.main
+SMTP_PROXY_ALLOW_UNSAFE_LOCAL_DRY_RUN=true python -m sl_smtp_proxy.main
 ```
 
 Forwarding is disabled by default via `SMTP_PROXY_DRY_RUN=true`. Leave dry-run
 enabled until fake-upstream or disposable-account tests prove your configuration
 rewrites every external recipient as expected.
+
+The local dry-run command above is an explicit development escape hatch for the
+default loopback-only setup. It is rejected for `SMTP_PROXY_HOST=0.0.0.0`, `::`,
+or non-loopback hostnames/IPs; remote-capable binds must use SMTP AUTH, inbound
+TLS, non-default credentials, configured `USER_MAILBOXES`, and
+`ALLOW_DIRECT_EXTERNAL_SEND=false`.
 
 For upstream SMTP delivery, configure the real SMTP server and TLS mode:
 

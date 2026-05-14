@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.abspath(CORE_SRC))
 sys.path.insert(0, os.path.abspath(SIMPLELOGIN_SRC))
 
 from sl_smtp_proxy.config import SmtpProxyConfig, load_config_from_env
+from sl_smtp_proxy.config_validation import StartupConfigError
 from sl_smtp_proxy.forwarder import UpstreamSmtpForwarder
 from sl_smtp_proxy.healthcheck import check_health
 from sl_smtp_proxy.smtp_server import SmtpProxyServer
@@ -216,6 +217,14 @@ class FakeResolverWithOwnedAliases:
         return "reply+alice@simplelogin.co"
 
 
+def local_smtp_config(**overrides):
+    values = {"host": "127.0.0.1", "port": 0}
+    values.update(overrides)
+    if values.get("dry_run", True):
+        values.setdefault("allow_unsafe_local_dry_run", True)
+    return SmtpProxyConfig(**values)
+
+
 class UpstreamForwarderTests(unittest.TestCase):
     def _message(self):
         msg = EmailMessage()
@@ -307,7 +316,7 @@ class UpstreamForwarderTests(unittest.TestCase):
 
 class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.server = SmtpProxyServer(SmtpProxyConfig(host="127.0.0.1", port=0, require_auth=False))
+        self.server = SmtpProxyServer(local_smtp_config(host="127.0.0.1", port=0, require_auth=False))
         await self.server.start()
 
     async def asyncTearDown(self):
@@ -331,7 +340,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_healthcheck_passes_for_running_server(self):
         check_health(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=self.server.port,
                 require_auth=False,
@@ -339,9 +348,29 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             timeout_seconds=2,
         )
 
+    async def test_unsafe_remote_config_rejects_before_controller_start(self):
+        unsafe_server = SmtpProxyServer(
+            SmtpProxyConfig(
+                host="0.0.0.0",
+                port=0,
+                require_auth=False,
+                require_tls=True,
+                username="smtp-user",
+                password="strong-password",
+                user_mailboxes={"sender@example.com"},
+            )
+        )
+
+        with mock.patch("sl_smtp_proxy.smtp_server._SmtpProxyController") as controller_cls:
+            with self.assertRaisesRegex(StartupConfigError, "SMTP_PROXY_REQUIRE_AUTH"):
+                await unsafe_server.start()
+
+        controller_cls.assert_not_called()
+        self.assertIsNone(unsafe_server._controller)
+
     async def test_mail_from_rejects_sender_outside_user_mailboxes(self):
         sender_server = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=False,
@@ -364,7 +393,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mail_from_accepts_configured_user_mailbox(self):
         sender_server = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=False,
@@ -399,7 +428,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
         tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(tempdir.cleanup)
         proxy = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 simplelogin_base_url=fake_simplelogin.url,
                 simplelogin_api_key="test-api-key",
                 host="127.0.0.1",
@@ -465,7 +494,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
         tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(tempdir.cleanup)
         proxy = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 simplelogin_base_url=fake_simplelogin.url,
                 simplelogin_api_key="test-api-key",
                 host="127.0.0.1",
@@ -508,7 +537,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_message_over_max_size_is_rejected_before_planning(self):
         size_server = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=False,
@@ -537,7 +566,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_smtp_submission_uses_injected_resolver_for_rewrite_plan(self):
         rewrite_server = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=False,
@@ -570,7 +599,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_audit_logs_are_structured_and_do_not_include_message_content(self):
         rewrite_server = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=False,
@@ -617,7 +646,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_cc_alias_selects_alias_for_reply_all_with_new_external_recipient(self):
         selected_aliases = []
         rewrite_server = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=False,
@@ -658,7 +687,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_multiple_distinct_aliases_reject_at_smtp_layer(self):
         selected_aliases = []
         rewrite_server = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=False,
@@ -695,7 +724,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_alias_suffix_bcc_selects_alias_without_control_domain(self):
         selected_aliases = []
         rewrite_server = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=False,
@@ -733,7 +762,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_duplicate_cc_and_bcc_alias_selects_alias(self):
         selected_aliases = []
         rewrite_server = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=False,
@@ -790,7 +819,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
         )
         upstream.start()
         proxy = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=False,
@@ -857,7 +886,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
         )
         upstream.start()
         proxy = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=False,
@@ -923,7 +952,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
         )
         upstream.start()
         proxy = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=False,
@@ -986,7 +1015,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
         tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(tempdir.cleanup)
         proxy = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 simplelogin_base_url=fake_simplelogin.url,
                 simplelogin_api_key="test-api-key",
                 host="127.0.0.1",
@@ -1050,7 +1079,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
         )
         upstream.start()
         proxy = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=False,
@@ -1094,7 +1123,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_upstream_unavailable_rejects_without_accepting_message(self):
         proxy = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=False,
@@ -1127,7 +1156,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_auth_required_rejects_unauthenticated_mail_from(self):
         auth_server = SmtpProxyServer(
-            SmtpProxyConfig(host="127.0.0.1", port=0, require_auth=True, username="user", password="pass")
+            local_smtp_config(host="127.0.0.1", port=0, require_auth=True, username="user", password="pass")
         )
         await auth_server.start()
         try:
@@ -1149,7 +1178,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_auth_plain_accepts_configured_credentials(self):
         auth_server = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=True,
@@ -1177,7 +1206,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_auth_failure_is_delayed_and_audited(self):
         auth_server = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=True,
@@ -1217,7 +1246,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_auth_login_accepts_configured_credentials(self):
         auth_server = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=True,
@@ -1248,7 +1277,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_auth_login_can_be_disabled(self):
         auth_server = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=True,
@@ -1279,7 +1308,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_starttls_requires_tls_before_auth_and_accepts_login_after_upgrade(self):
         cert_file, key_file = make_test_cert(self)
         auth_server = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=True,
@@ -1335,7 +1364,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_implicit_tls_accepts_login_on_encrypted_socket(self):
         cert_file, key_file = make_test_cert(self)
         auth_server = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=True,
@@ -1377,7 +1406,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
     async def test_implicit_tls_auth_false_positive_warning_is_suppressed(self):
         cert_file, key_file = make_test_cert(self)
         auth_server = SmtpProxyServer(
-            SmtpProxyConfig(
+            local_smtp_config(
                 host="127.0.0.1",
                 port=0,
                 require_auth=True,
@@ -1421,7 +1450,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_require_tls_refuses_start_until_tls_is_configured(self):
         tls_server = SmtpProxyServer(
-            SmtpProxyConfig(host="127.0.0.1", port=0, require_auth=True, require_tls=True)
+            local_smtp_config(host="127.0.0.1", port=0, require_auth=True, require_tls=True)
         )
 
         with self.assertRaisesRegex(RuntimeError, "SMTP_PROXY_TLS_CERT_FILE"):
