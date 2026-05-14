@@ -17,6 +17,7 @@ from .forwarder import UpstreamForwardingError, UpstreamSmtpForwarder
 from .logging import audit_event, plan_audit_fields, plan_summary, redact_address, safe_reason
 from .message_transform import apply_transform, build_plan_for_message, transformed_envelope_recipients
 from .reverse_alias_resolver import resolver_from_config
+from .safety_verifier import verify_post_transform_safety, visible_recipient_count
 
 
 LOGGER = logging.getLogger(__name__)
@@ -108,6 +109,28 @@ class SmtpProxyHandler:
 
         transformed_message = apply_transform(message, plan, self.config)
         transformed_recipients = transformed_envelope_recipients(plan)
+        verification = verify_post_transform_safety(
+            transformed_message,
+            transformed_recipients,
+            self.config,
+            plan,
+            extra_simplelogin_aliases=extra_simplelogin_aliases,
+        )
+        if not verification.accepted:
+            LOGGER.info(
+                "audit %s",
+                audit_event(
+                    "smtp_message_rejected",
+                    peer=_peer_host(session),
+                    policy="post_transform_safety_verifier",
+                    invariant=verification.invariant,
+                    location=verification.location,
+                    reason=verification.reason,
+                    recipient_count=len(transformed_recipients),
+                    visible_recipient_count=visible_recipient_count(transformed_message),
+                ),
+            )
+            return "550 Message rejected by SimpleLogin proxy post-transform safety verifier"
         if not transformed_recipients:
             LOGGER.info(
                 "audit %s",

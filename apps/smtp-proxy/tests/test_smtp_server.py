@@ -527,7 +527,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
                 alias_suffix_domains={"@example.net"},
             ),
             reverse_alias_resolver=lambda recipient, alias: (
-                selected_aliases.append(alias) or f"reverse-for-{recipient}"
+                selected_aliases.append(alias) or f"reply+{recipient.split('@', 1)[0]}@simplelogin.co"
             ),
         )
         await rewrite_server.start()
@@ -628,6 +628,71 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             content = captured["content"].decode("utf-8", errors="replace")
             self.assertNotIn("alice@example.com", content)
             self.assertNotIn("orders@example.net", content)
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
+    async def test_post_transform_verifier_rejects_unsafe_transform_before_upstream(self):
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        proxy = SmtpProxyServer(
+            SmtpProxyConfig(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+                alias_suffix_domains={"@example.net"},
+            ),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "Alice <alice@example.com>"
+            msg["Bcc"] = "orders@example.net"
+            msg.set_content("private body")
+
+            with mock.patch(
+                "sl_smtp_proxy.smtp_server.apply_transform",
+                side_effect=lambda message, plan, config: message,
+            ):
+                with self.assertLogs("sl_smtp_proxy.smtp_server", level="INFO") as captured:
+                    result = await asyncio.get_running_loop().run_in_executor(
+                        None,
+                        submit_message,
+                        proxy.port,
+                        msg,
+                        ["alice@example.com", "orders@example.net"],
+                    )
+
+            self.assertEqual(result[0], 550)
+            self.assertIn("post-transform safety verifier", result[1])
+            self.assertEqual(upstream_handler.messages, [])
+            audit_payloads = [
+                json.loads(line.split("audit ", 1)[1])
+                for line in captured.output
+                if "audit " in line
+            ]
+            verifier_payload = next(
+                payload
+                for payload in audit_payloads
+                if payload.get("policy") == "post_transform_safety_verifier"
+            )
+            self.assertEqual(verifier_payload["reason"], "bcc_header_present")
+            self.assertNotIn("alice@example.com", "\n".join(captured.output))
+            self.assertNotIn("orders@example.net", "\n".join(captured.output))
+            self.assertNotIn("private body", "\n".join(captured.output))
         finally:
             await proxy.stop()
             upstream.stop(no_assert=True)
