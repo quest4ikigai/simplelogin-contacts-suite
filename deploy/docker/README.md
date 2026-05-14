@@ -112,10 +112,14 @@ SMTP_PROXY_PORT=2525
 SMTP_PROXY_REQUIRE_AUTH=true
 SMTP_PROXY_REQUIRE_TLS=false
 SMTP_PROXY_AUTH_FAILURE_DELAY_SECONDS=1.0
+SMTP_PROXY_ALLOW_UNSAFE_LOCAL_DRY_RUN=true
 ```
 
-If Docker Desktop needs port publishing on all interfaces, keep your macOS
-firewall closed to untrusted networks and use strong SMTP credentials.
+The unsafe local dry-run escape hatch only works for loopback binds with
+`SMTP_PROXY_DRY_RUN=true`. If Docker Desktop needs the container to listen on
+`0.0.0.0`, configure inbound TLS, non-default SMTP credentials, and
+`USER_MAILBOXES`; the proxy refuses remote-capable binds with local-only safety
+shortcuts.
 
 ### Mode B: Home Server Over VPN
 
@@ -236,6 +240,7 @@ Recommended values:
 ```dotenv
 SMTP_PROXY_REQUIRE_AUTH=true
 SMTP_PROXY_DRY_RUN=true
+SMTP_PROXY_ALLOW_UNSAFE_LOCAL_DRY_RUN=false
 SMTP_PROXY_AUTH_LOGIN_ENABLED=true
 SMTP_PROXY_AUTH_FAILURE_DELAY_SECONDS=1.0
 FAIL_CLOSED=true

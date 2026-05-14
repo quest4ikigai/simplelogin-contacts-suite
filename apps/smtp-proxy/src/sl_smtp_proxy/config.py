@@ -52,6 +52,7 @@ class SmtpProxyConfig:
     auth_failure_delay_seconds: float = 1.0
     max_message_bytes: int = 25 * 1024 * 1024
     dry_run: bool = True
+    allow_unsafe_local_dry_run: bool = False
 
     upstream_host: str = "host.docker.internal"
     upstream_port: int = 1025
@@ -120,6 +121,7 @@ def load_config_from_env() -> SmtpProxyConfig:
         auth_failure_delay_seconds=env_float("SMTP_PROXY_AUTH_FAILURE_DELAY_SECONDS", 1.0),
         max_message_bytes=env_int("SMTP_PROXY_MAX_MESSAGE_BYTES", 25 * 1024 * 1024),
         dry_run=env_bool("SMTP_PROXY_DRY_RUN", True),
+        allow_unsafe_local_dry_run=env_bool("SMTP_PROXY_ALLOW_UNSAFE_LOCAL_DRY_RUN", False),
         upstream_host=os.environ.get("UPSTREAM_SMTP_HOST", "host.docker.internal"),
         upstream_port=env_int("UPSTREAM_SMTP_PORT", 1025),
         upstream_username=os.environ.get("UPSTREAM_SMTP_USERNAME", ""),
