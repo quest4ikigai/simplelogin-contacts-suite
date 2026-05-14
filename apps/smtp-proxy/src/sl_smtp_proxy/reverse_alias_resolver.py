@@ -31,7 +31,11 @@ class ReverseAliasResolver:
         contact_email = _contact_email(recipient)
 
         cached = self.cache.find_contact(alias_id, contact_email)
-        if cached:
+        if cached and not self.cache.contact_needs_refresh(
+            alias_id,
+            contact_email,
+            self.config.cache_contact_ttl_seconds,
+        ):
             reverse_alias_address, block_forward = cached
             if block_forward:
                 raise ReverseAliasResolutionError("reverse alias contact is blocked")

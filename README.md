@@ -28,7 +28,6 @@ packages/
   contacts-core/        Shared generated-contact naming helpers.
   shared-models/        Shared config and email-address helpers.
 deploy/docker/          Docker deployment files for the apps.
-docs/plans/             Original implementation plan pack.
 ```
 
 ## Current Status

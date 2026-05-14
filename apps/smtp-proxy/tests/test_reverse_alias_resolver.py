@@ -4,6 +4,7 @@ import threading
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
@@ -72,6 +73,47 @@ class ReverseAliasResolverTests(unittest.TestCase):
 
         self.assertEqual(reverse_alias, "reply+alice@simplelogin.co")
         self.assertEqual(client.get_or_create_calls, [])
+
+    def test_stale_cached_contact_is_refreshed_from_api(self):
+        self.cache.upsert_alias("123", "shopping@example.com")
+        self.cache.upsert_contact(
+            "456",
+            "123",
+            "Alice <alice@example.com>",
+            "alice@example.com",
+            "reply+old@simplelogin.co",
+        )
+        stale_time = datetime.now(timezone.utc) - timedelta(seconds=120)
+        with self.cache.connect() as conn:
+            conn.execute(
+                "UPDATE contacts SET updated_at = ? WHERE id = ?",
+                (stale_time.isoformat(), "456"),
+            )
+        client = FakeSimpleLoginClient(
+            contacts={
+                ("123", "alice@example.com"): AliasContact(
+                    id="456",
+                    alias_id="123",
+                    contact="Alice <alice@example.com>",
+                    reverse_alias=None,
+                    reverse_alias_address="reply+fresh@simplelogin.co",
+                ),
+            },
+        )
+        config = SmtpProxyConfig(
+            cache_path=self.cache_path,
+            cache_contact_ttl_seconds=60,
+        )
+        resolver = ReverseAliasResolver(config, cache=self.cache, client=client)
+
+        reverse_alias = resolver("alice@example.com", "shopping@example.com")
+
+        self.assertEqual(reverse_alias, "reply+fresh@simplelogin.co")
+        self.assertEqual(client.get_or_create_calls, [("123", "alice@example.com")])
+        self.assertEqual(
+            self.cache.find_reverse_alias("123", "alice@example.com"),
+            "reply+fresh@simplelogin.co",
+        )
 
     def test_missing_contact_is_created_and_cached(self):
         client = FakeSimpleLoginClient(

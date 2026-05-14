@@ -16,5 +16,3 @@ Forwarding must:
 - Reject messages that specify two distinct SimpleLogin aliases.
 - Strip internal metadata headers and alias selector recipients.
 - Support a single `To` alias cover recipient for anonymized Bcc sends by preserving the visible `To` header while dropping that alias from the SMTP envelope.
-
-The original detailed plan lives in `docs/plans/03-SMTP-PROXY-SPEC.md`.
