@@ -5,6 +5,7 @@ import hmac
 import logging
 import socket
 import ssl
+import time
 from typing import Optional
 
 from aiosmtpd.controller import Controller
@@ -13,7 +14,7 @@ from alias_routing_core import normalize_email_address
 
 from .config import SmtpProxyConfig
 from .forwarder import UpstreamForwardingError, UpstreamSmtpForwarder
-from .logging import plan_summary
+from .logging import audit_event, plan_audit_fields, plan_summary, redact_address, safe_reason
 from .message_transform import apply_transform, build_plan_for_message, transformed_envelope_recipients
 from .reverse_alias_resolver import resolver_from_config
 
@@ -35,6 +36,15 @@ class SmtpProxyHandler:
 
     async def handle_MAIL(self, server, session, envelope, address, mail_options) -> str:
         if not _sender_allowed(self.config, address):
+            LOGGER.info(
+                "audit %s",
+                audit_event(
+                    "smtp_sender_rejected",
+                    peer=_peer_host(session),
+                    sender=redact_address(address),
+                    reason="sender_not_allowed",
+                ),
+            )
             return "550 Sender address is not allowed by SimpleLogin proxy policy"
         envelope.mail_from = address
         envelope.mail_options.extend(mail_options)
@@ -55,6 +65,15 @@ class SmtpProxyHandler:
                 extra_simplelogin_aliases = self.reverse_alias_resolver.owned_alias_emails()
             except Exception as exc:
                 public_message = getattr(exc, "public_message", type(exc).__name__)
+                LOGGER.info(
+                    "audit %s",
+                    audit_event(
+                        "smtp_message_rejected",
+                        peer=_peer_host(session),
+                        policy="alias_refresh_failed",
+                        reason=safe_reason(f"SimpleLogin alias refresh failed: {public_message}"),
+                    ),
+                )
                 return f"550 SimpleLogin alias refresh failed: {public_message}"
 
         message, plan = build_plan_for_message(
@@ -67,14 +86,49 @@ class SmtpProxyHandler:
         )
         self.last_plan = plan
         LOGGER.info("transform_plan %s", plan_summary(plan, self.config.log_redact_addresses))
+        LOGGER.info(
+            "audit %s",
+            audit_event(
+                "smtp_transform_plan",
+                peer=_peer_host(session),
+                **plan_audit_fields(plan, self.config.log_redact_addresses),
+            ),
+        )
         if plan.rejected:
+            LOGGER.info(
+                "audit %s",
+                audit_event(
+                    "smtp_message_rejected",
+                    peer=_peer_host(session),
+                    policy="transform_plan_rejected",
+                    reason=safe_reason(plan.rejection_reason),
+                ),
+            )
             return f"550 {plan.rejection_reason or 'Message rejected by SimpleLogin proxy policy'}"
 
         transformed_message = apply_transform(message, plan, self.config)
         transformed_recipients = transformed_envelope_recipients(plan)
         if not transformed_recipients:
+            LOGGER.info(
+                "audit %s",
+                audit_event(
+                    "smtp_message_rejected",
+                    peer=_peer_host(session),
+                    policy="no_deliverable_recipients",
+                    reason="No deliverable recipients after SimpleLogin routing",
+                ),
+            )
             return "550 No deliverable recipients after SimpleLogin routing"
         if self.config.dry_run:
+            LOGGER.info(
+                "audit %s",
+                audit_event(
+                    "smtp_message_rejected",
+                    peer=_peer_host(session),
+                    policy="dry_run",
+                    reason="SimpleLogin SMTP proxy dry-run: message not forwarded",
+                ),
+            )
             return "550 SimpleLogin SMTP proxy dry-run: message not forwarded"
 
         try:
@@ -87,11 +141,32 @@ class SmtpProxyHandler:
                 transformed_message,
             )
         except UpstreamForwardingError as exc:
+            LOGGER.info(
+                "audit %s",
+                audit_event(
+                    "smtp_message_rejected",
+                    peer=_peer_host(session),
+                    policy="upstream_unavailable",
+                    reason=safe_reason(exc.public_message),
+                ),
+            )
             return f"550 {exc.public_message}"
+        LOGGER.info(
+            "audit %s",
+            audit_event(
+                "smtp_message_forwarded",
+                peer=_peer_host(session),
+                recipient_count=len(transformed_recipients),
+            ),
+        )
         return "250 Message accepted for delivery"
 
     def handle_exception(self, error: Exception) -> str:
         LOGGER.exception("SMTP proxy handler failed: %s", type(error).__name__)
+        LOGGER.info(
+            "audit %s",
+            audit_event("smtp_internal_error", error_type=type(error).__name__),
+        )
         return "451 SimpleLogin SMTP proxy internal error"
 
 
@@ -170,7 +245,28 @@ def _authenticator(config: SmtpProxyConfig):
             expected_password,
         )
         if success:
+            LOGGER.info(
+                "audit %s",
+                audit_event(
+                    "smtp_auth_succeeded",
+                    mechanism=str(mechanism or "unknown"),
+                    peer=_peer_host(session),
+                ),
+            )
             return AuthResult(success=True)
+
+        delay_seconds = max(0.0, config.auth_failure_delay_seconds)
+        LOGGER.info(
+            "audit %s",
+            audit_event(
+                "smtp_auth_failed",
+                delay_seconds=delay_seconds,
+                mechanism=str(mechanism or "unknown"),
+                peer=_peer_host(session),
+            ),
+        )
+        if delay_seconds:
+            time.sleep(delay_seconds)
         return AuthResult(
             success=False,
             handled=False,
@@ -203,6 +299,15 @@ def _sender_allowed(config: SmtpProxyConfig, sender: str) -> bool:
         if normalized
     }
     return normalized_sender in allowed
+
+
+def _peer_host(session) -> str:
+    peer = getattr(session, "peer", None)
+    if isinstance(peer, tuple) and peer:
+        return str(peer[0])
+    if peer:
+        return str(peer)
+    return "unknown"
 
 
 def _tls_settings(config: SmtpProxyConfig):

@@ -21,6 +21,13 @@ def env_int(name: str, default: int) -> int:
     return int(raw)
 
 
+def env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return float(raw)
+
+
 def env_csv(name: str) -> List[str]:
     raw = os.environ.get(name, "")
     return [item.strip() for item in raw.split(",") if item.strip()]
@@ -42,6 +49,7 @@ class SmtpProxyConfig:
     tls_cert_file: str = ""
     tls_key_file: str = ""
     auth_login_enabled: bool = True
+    auth_failure_delay_seconds: float = 1.0
     max_message_bytes: int = 25 * 1024 * 1024
     dry_run: bool = True
 
@@ -108,6 +116,7 @@ def load_config_from_env() -> SmtpProxyConfig:
         tls_cert_file=os.environ.get("SMTP_PROXY_TLS_CERT_FILE", ""),
         tls_key_file=os.environ.get("SMTP_PROXY_TLS_KEY_FILE", ""),
         auth_login_enabled=env_bool("SMTP_PROXY_AUTH_LOGIN_ENABLED", True),
+        auth_failure_delay_seconds=env_float("SMTP_PROXY_AUTH_FAILURE_DELAY_SECONDS", 1.0),
         max_message_bytes=env_int("SMTP_PROXY_MAX_MESSAGE_BYTES", 25 * 1024 * 1024),
         dry_run=env_bool("SMTP_PROXY_DRY_RUN", True),
         upstream_host=os.environ.get("UPSTREAM_SMTP_HOST", "host.docker.internal"),

@@ -109,6 +109,7 @@ SMTP_PROXY_HOST=127.0.0.1
 SMTP_PROXY_PORT=2525
 SMTP_PROXY_REQUIRE_AUTH=true
 SMTP_PROXY_REQUIRE_TLS=false
+SMTP_PROXY_AUTH_FAILURE_DELAY_SECONDS=1.0
 ```
 
 If Docker Desktop needs port publishing on all interfaces, keep your macOS
@@ -218,6 +219,7 @@ Recommended values:
 SMTP_PROXY_REQUIRE_AUTH=true
 SMTP_PROXY_DRY_RUN=true
 SMTP_PROXY_AUTH_LOGIN_ENABLED=true
+SMTP_PROXY_AUTH_FAILURE_DELAY_SECONDS=1.0
 FAIL_CLOSED=true
 KEEP_UNKNOWN_SIMPLELOGIN_ADDRESSES=true
 STRIP_OWN_ALIASES=true
@@ -230,6 +232,47 @@ LOG_SUBJECT=false
 
 Do not run an unauthenticated public SMTP relay. Do not set
 `ALLOW_DIRECT_EXTERNAL_SEND=true` for normal use.
+
+## Audit Logs
+
+The proxy writes structured audit events as log lines prefixed with `audit`.
+These events include policy outcomes and counts, not message bodies, subjects,
+attachments, API keys, SMTP passwords, or raw recipient lists.
+
+Example:
+
+```text
+audit {"drop_count":1,"event":"smtp_transform_plan","keep_count":0,"peer":"127.0.0.1","reason":"none","reject_count":0,"rejected":false,"rewrite_count":1,"selected_alias":"o***s@example.net","selected_alias_source":"alias_selector"}
+```
+
+Use normal Docker logs to inspect them:
+
+```bash
+docker logs simplelogin-smtp-proxy
+```
+
+## Cache Backup And Restore
+
+The SQLite cache lives at `CACHE_PATH`, which defaults to `/data/cache.sqlite3`
+inside the container and is stored on the `smtp_proxy_data` Docker volume.
+
+Back up the cache:
+
+```bash
+docker cp simplelogin-smtp-proxy:/data/cache.sqlite3 ./cache.sqlite3.backup
+```
+
+Restore the cache:
+
+```bash
+docker stop simplelogin-smtp-proxy
+docker cp ./cache.sqlite3.backup simplelogin-smtp-proxy:/data/cache.sqlite3
+docker start simplelogin-smtp-proxy
+```
+
+If you lose the cache, the proxy can rebuild owned aliases and recently needed
+reverse-alias contacts from SimpleLogin. A backup mainly avoids extra API calls
+and preserves cached recently used contacts after a host or volume migration.
 
 ## Useful Commands
 

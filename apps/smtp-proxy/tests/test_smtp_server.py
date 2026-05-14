@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 from email import policy
 from email.parser import BytesParser
 import os
@@ -9,9 +10,12 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import warnings
 from email.message import EmailMessage
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 from aiosmtpd.controller import Controller
 
@@ -140,6 +144,64 @@ class CaptureUpstreamHandler:
         return "250 OK"
 
 
+class FakeSimpleLoginHttpServer:
+    def __init__(self, test_case):
+        self.requests = []
+        self.aliases = [{"id": 123, "email": "orders@example.net"}]
+        self.contacts = []
+        self.created_contact = {
+            "id": 456,
+            "contact": "Alice <alice@example.com>",
+            "reverse_alias_address": "reply+alice@simplelogin.co",
+        }
+        fake = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                fake.requests.append((self.command, self.path, self.headers.get("Authentication"), None))
+                if self.path == "/api/v2/aliases?page_id=0":
+                    self._json(200, {"aliases": fake.aliases})
+                    return
+                if self.path == "/api/aliases/123/contacts?page_id=0":
+                    self._json(200, {"contacts": fake.contacts})
+                    return
+                self._json(404, {"error": "not found"})
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8")
+                fake.requests.append((self.command, self.path, self.headers.get("Authentication"), body))
+                if self.path == "/api/aliases/123/contacts":
+                    self._json(201, {"contact": fake.created_contact})
+                    return
+                self._json(404, {"error": "not found"})
+
+            def log_message(self, format, *args):
+                return
+
+            def _json(self, status, payload):
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        test_case.addCleanup(self.close)
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def close(self):
+        self.httpd.shutdown()
+        self.thread.join(timeout=2)
+        self.httpd.server_close()
+
+
 class FakeResolverWithOwnedAliases:
     def __init__(self):
         self.calls = []
@@ -231,6 +293,35 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await sender_server.stop()
 
+    async def test_message_over_max_size_is_rejected_before_planning(self):
+        size_server = SmtpProxyServer(
+            SmtpProxyConfig(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                max_message_bytes=128,
+            )
+        )
+        await size_server.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg.set_content("x" * 1024)
+
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                submit_message,
+                size_server.port,
+                msg,
+                ["alice@example.com"],
+            )
+
+            self.assertEqual(result[0], 552)
+            self.assertIsNone(size_server.last_plan)
+        finally:
+            await size_server.stop()
+
     async def test_smtp_submission_uses_injected_resolver_for_rewrite_plan(self):
         rewrite_server = SmtpProxyServer(
             SmtpProxyConfig(
@@ -261,6 +352,52 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
                 rewrite_server.last_plan.actions[0].replacement,
                 "reply+alice@simplelogin.co",
             )
+        finally:
+            await rewrite_server.stop()
+
+    async def test_audit_logs_are_structured_and_do_not_include_message_content(self):
+        rewrite_server = SmtpProxyServer(
+            SmtpProxyConfig(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+            ),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+        )
+        await rewrite_server.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["Subject"] = "Private subject"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("private body")
+
+            with self.assertLogs("sl_smtp_proxy.smtp_server", level="INFO") as captured:
+                result = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    submit_message,
+                    rewrite_server.port,
+                    msg,
+                    ["alice@example.com"],
+                )
+
+            self.assertEqual(result[0], 550)
+            log_text = "\n".join(captured.output)
+            self.assertNotIn("Private subject", log_text)
+            self.assertNotIn("private body", log_text)
+            audit_payloads = [
+                json.loads(line.split("audit ", 1)[1])
+                for line in captured.output
+                if "audit " in line
+            ]
+            self.assertTrue(audit_payloads)
+            self.assertIn("smtp_transform_plan", {payload["event"] for payload in audit_payloads})
+            transform_payload = next(
+                payload for payload in audit_payloads if payload["event"] == "smtp_transform_plan"
+            )
+            self.assertEqual(transform_payload["selected_alias"], "s***g@example.com")
+            self.assertEqual(transform_payload["rewrite_count"], 1)
         finally:
             await rewrite_server.stop()
 
@@ -556,6 +693,73 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             await proxy.stop()
             upstream.stop(no_assert=True)
 
+    async def test_real_simplelogin_and_fake_upstream_integration(self):
+        fake_simplelogin = FakeSimpleLoginHttpServer(self)
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        proxy = SmtpProxyServer(
+            SmtpProxyConfig(
+                simplelogin_base_url=fake_simplelogin.url,
+                simplelogin_api_key="test-api-key",
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+                user_mailboxes={"sender@example.com"},
+                alias_suffix_domains={"@example.net"},
+                cache_path=os.path.join(tempdir.name, "cache.sqlite3"),
+            ),
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "Alice <alice@example.com>"
+            msg["Bcc"] = "orders@example.net"
+            msg.set_content("private body")
+
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                submit_message,
+                proxy.port,
+                msg,
+                ["alice@example.com", "orders@example.net"],
+                "sender@example.com",
+            )
+
+            self.assertEqual(result[0], 250)
+            self.assertEqual([request[0] for request in fake_simplelogin.requests], ["GET", "GET", "POST"])
+            self.assertTrue(all(request[2] == "test-api-key" for request in fake_simplelogin.requests))
+            self.assertEqual(
+                json.loads(fake_simplelogin.requests[-1][3]),
+                {"contact": "alice@example.com"},
+            )
+            self.assertEqual(len(upstream_handler.messages), 1)
+            captured = upstream_handler.messages[0]
+            self.assertEqual(captured["mail_from"], "sender@example.com")
+            self.assertEqual(captured["rcpt_tos"], ["reply+alice@simplelogin.co"])
+            forwarded = BytesParser(policy=policy.default).parsebytes(captured["content"])
+            self.assertEqual(forwarded.get("To"), "Alice <reply+alice@simplelogin.co>")
+            self.assertIsNone(forwarded.get("Bcc"))
+            content = captured["content"].decode("utf-8", errors="replace")
+            self.assertNotIn("alice@example.com", content)
+            self.assertNotIn("orders@example.net", content)
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
     async def test_forwarding_strips_api_discovered_own_alias_without_env_list(self):
         upstream_handler = CaptureUpstreamHandler()
         upstream_port = free_port()
@@ -690,6 +894,46 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             result = await asyncio.get_running_loop().run_in_executor(None, authenticate)
 
             self.assertEqual(result[0], 235)
+        finally:
+            await auth_server.stop()
+
+    async def test_auth_failure_is_delayed_and_audited(self):
+        auth_server = SmtpProxyServer(
+            SmtpProxyConfig(
+                host="127.0.0.1",
+                port=0,
+                require_auth=True,
+                username="user",
+                password="pass",
+                auth_failure_delay_seconds=2.5,
+            )
+        )
+        await auth_server.start()
+        try:
+            def authenticate():
+                payload = base64.b64encode(b"\x00user\x00wrong").decode("ascii")
+                with socket.create_connection(("127.0.0.1", auth_server.port), timeout=2) as sock:
+                    fileobj = sock.makefile("rwb", buffering=0)
+                    read_smtp_response(fileobj)
+                    send_smtp_line(fileobj, "EHLO test.local")
+                    read_smtp_response(fileobj)
+                    send_smtp_line(fileobj, f"AUTH PLAIN {payload}")
+                    return read_smtp_response(fileobj)
+
+            with mock.patch("sl_smtp_proxy.smtp_server.time.sleep") as sleep:
+                with self.assertLogs("sl_smtp_proxy.smtp_server", level="INFO") as captured:
+                    result = await asyncio.get_running_loop().run_in_executor(None, authenticate)
+
+            self.assertEqual(result[0], 535)
+            sleep.assert_called_once_with(2.5)
+            audit_payloads = [
+                json.loads(line.split("audit ", 1)[1])
+                for line in captured.output
+                if "audit " in line
+            ]
+            self.assertEqual(audit_payloads[0]["event"], "smtp_auth_failed")
+            self.assertEqual(audit_payloads[0]["delay_seconds"], 2.5)
+            self.assertNotIn("wrong", "\n".join(captured.output))
         finally:
             await auth_server.stop()
 
