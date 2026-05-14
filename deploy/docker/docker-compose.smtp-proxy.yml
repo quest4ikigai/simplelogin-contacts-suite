@@ -10,6 +10,8 @@ services:
       - "2525:2525"
     volumes:
       - smtp_proxy_data:/data
+      # Uncomment to mount file-backed secrets referenced by *_FILE env vars.
+      # - ./secrets:/run/secrets/simplelogin-smtp-proxy:ro
       # Uncomment after placing proxy TLS cert/key files under deploy/docker/certs.
       # - ./certs:/certs:ro
     healthcheck:
