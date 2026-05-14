@@ -49,8 +49,12 @@ when using the `_FILE` variant:
 ```dotenv
 SIMPLELOGIN_API_KEY=
 SIMPLELOGIN_API_KEY_FILE=/run/secrets/simplelogin-smtp-proxy/simplelogin_api_key
+SMTP_PROXY_USERNAME=
+SMTP_PROXY_USERNAME_FILE=/run/secrets/simplelogin-smtp-proxy/smtp_proxy_username
 SMTP_PROXY_PASSWORD=
 SMTP_PROXY_PASSWORD_FILE=/run/secrets/simplelogin-smtp-proxy/smtp_proxy_password
+UPSTREAM_SMTP_USERNAME=
+UPSTREAM_SMTP_USERNAME_FILE=/run/secrets/simplelogin-smtp-proxy/upstream_smtp_username
 UPSTREAM_SMTP_PASSWORD=
 UPSTREAM_SMTP_PASSWORD_FILE=/run/secrets/simplelogin-smtp-proxy/upstream_smtp_password
 ```
@@ -60,7 +64,9 @@ Create the local secret files and mount the directory read-only:
 ```bash
 mkdir -p secrets
 printf '%s\n' 'your-simplelogin-api-key' > secrets/simplelogin_api_key
+printf '%s\n' 'your-proxy-smtp-username' > secrets/smtp_proxy_username
 printf '%s\n' 'your-proxy-smtp-password' > secrets/smtp_proxy_password
+printf '%s\n' 'your-upstream-smtp-username' > secrets/upstream_smtp_username
 printf '%s\n' 'your-upstream-smtp-password' > secrets/upstream_smtp_password
 chmod 600 secrets/*
 ```
