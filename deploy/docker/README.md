@@ -36,6 +36,8 @@ UPSTREAM_SMTP_HOST=host.docker.internal
 UPSTREAM_SMTP_PORT=1025
 UPSTREAM_SMTP_USERNAME=...
 UPSTREAM_SMTP_PASSWORD=...
+UPSTREAM_SMTP_TLS_MODE=none
+UPSTREAM_SMTP_TLS_VERIFY=true
 USER_MAILBOXES=user@example.com
 ALIAS_SUFFIX_DOMAINS=@example.net,@subdomain.simplelogin.example,.suffix@simplelogin.example
 ```
@@ -153,6 +155,22 @@ Requirements before public exposure:
 The proxy supports inbound STARTTLS and implicit TLS with configured certificate
 and key files. Do not expose it publicly unless the certificate is valid for the
 client-facing hostname and firewall/rate-limit controls are in place.
+
+## Upstream SMTP TLS
+
+Use `UPSTREAM_SMTP_TLS_MODE` to control the proxy-to-upstream hop:
+
+```dotenv
+UPSTREAM_SMTP_TLS_MODE=none
+UPSTREAM_SMTP_TLS_VERIFY=true
+```
+
+Supported modes are `none`, `starttls`, and `implicit`. Use `starttls` for
+port 587-style submission and `implicit` for port 465-style SMTPS.
+
+Certificate and hostname verification are enabled by default for upstream TLS.
+Set `UPSTREAM_SMTP_TLS_VERIFY=false` only for a trusted self-signed upstream,
+such as a private bridge or test SMTP server that you control.
 
 ## Apple Mail On macOS
 

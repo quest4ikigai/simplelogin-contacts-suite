@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 from email import policy
 from email.parser import BytesParser
 import os
@@ -26,7 +27,8 @@ sys.path.insert(0, os.path.abspath(APP_SRC))
 sys.path.insert(0, os.path.abspath(CORE_SRC))
 sys.path.insert(0, os.path.abspath(SIMPLELOGIN_SRC))
 
-from sl_smtp_proxy.config import SmtpProxyConfig
+from sl_smtp_proxy.config import SmtpProxyConfig, load_config_from_env
+from sl_smtp_proxy.forwarder import UpstreamSmtpForwarder
 from sl_smtp_proxy.healthcheck import check_health
 from sl_smtp_proxy.smtp_server import SmtpProxyServer
 from alias_routing_core import TransformAction
@@ -212,6 +214,95 @@ class FakeResolverWithOwnedAliases:
     def __call__(self, recipient, alias):
         self.calls.append((recipient, alias))
         return "reply+alice@simplelogin.co"
+
+
+class UpstreamForwarderTests(unittest.TestCase):
+    def _message(self):
+        msg = EmailMessage()
+        msg["From"] = "sender@example.com"
+        msg["To"] = "recipient@example.com"
+        msg.set_content("hello")
+        return msg
+
+    def test_upstream_starttls_uses_verifying_context_before_auth(self):
+        smtp = mock.MagicMock()
+        smtp_cm = mock.MagicMock()
+        smtp_cm.__enter__.return_value = smtp
+        tls_context = object()
+
+        with mock.patch("sl_smtp_proxy.forwarder.ssl.create_default_context", return_value=tls_context):
+            with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp_cm) as smtp_cls:
+                UpstreamSmtpForwarder(
+                    SmtpProxyConfig(
+                        upstream_tls_mode="starttls",
+                        upstream_username="user",
+                        upstream_password="pass",
+                    )
+                ).forward("sender@example.com", ["recipient@example.com"], self._message())
+
+        smtp_cls.assert_called_once_with("host.docker.internal", 1025, timeout=30)
+        smtp.starttls.assert_called_once_with(context=tls_context)
+        smtp.login.assert_called_once_with("user", "pass")
+        smtp.sendmail.assert_called_once()
+        self.assertLess(
+            smtp.method_calls.index(mock.call.starttls(context=tls_context)),
+            smtp.method_calls.index(mock.call.login("user", "pass")),
+        )
+
+    def test_upstream_starttls_verification_can_be_disabled(self):
+        smtp = mock.MagicMock()
+        smtp_cm = mock.MagicMock()
+        smtp_cm.__enter__.return_value = smtp
+
+        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp_cm):
+            UpstreamSmtpForwarder(
+                SmtpProxyConfig(
+                    upstream_tls_mode="starttls",
+                    upstream_tls_verify=False,
+                )
+            ).forward("sender@example.com", ["recipient@example.com"], self._message())
+
+        context = smtp.starttls.call_args.kwargs["context"]
+        self.assertFalse(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl.CERT_NONE)
+
+    def test_upstream_implicit_tls_uses_smtp_ssl(self):
+        smtp = mock.MagicMock()
+        smtp_cm = mock.MagicMock()
+        smtp_cm.__enter__.return_value = smtp
+        tls_context = object()
+
+        with mock.patch("sl_smtp_proxy.forwarder.ssl.create_default_context", return_value=tls_context):
+            with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP_SSL", return_value=smtp_cm) as smtp_ssl_cls:
+                with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP") as smtp_cls:
+                    UpstreamSmtpForwarder(
+                        SmtpProxyConfig(upstream_tls_mode="implicit")
+                    ).forward("sender@example.com", ["recipient@example.com"], self._message())
+
+        smtp_ssl_cls.assert_called_once_with(
+            "host.docker.internal",
+            1025,
+            timeout=30,
+            context=tls_context,
+        )
+        smtp_cls.assert_not_called()
+        smtp.starttls.assert_not_called()
+        smtp.ehlo.assert_called_once()
+        smtp.sendmail.assert_called_once()
+
+    def test_upstream_tls_mode_env_loads_from_environment(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "UPSTREAM_SMTP_TLS_MODE": "implicit",
+                "UPSTREAM_SMTP_TLS_VERIFY": "false",
+            },
+            clear=True,
+        ):
+            config = load_config_from_env()
+
+        self.assertEqual(config.upstream_tls_mode, "implicit")
+        self.assertFalse(config.upstream_tls_verify)
 
 
 class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
@@ -1159,6 +1250,51 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(result[0], 235)
         finally:
+            await auth_server.stop()
+
+    async def test_implicit_tls_auth_false_positive_warning_is_suppressed(self):
+        cert_file, key_file = make_test_cert(self)
+        auth_server = SmtpProxyServer(
+            SmtpProxyConfig(
+                host="127.0.0.1",
+                port=0,
+                require_auth=True,
+                require_tls=True,
+                tls_mode="implicit",
+                tls_cert_file=cert_file,
+                tls_key_file=key_file,
+                username="user",
+                password="pass",
+            )
+        )
+        mail_log = logging.getLogger("mail.log")
+        records = []
+
+        class CaptureHandler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = CaptureHandler(level=logging.WARNING)
+        old_level = mail_log.level
+        mail_log.addHandler(handler)
+        mail_log.setLevel(logging.WARNING)
+        try:
+            with warnings.catch_warnings(record=True) as captured_warnings:
+                warnings.simplefilter("always")
+                await auth_server.start()
+
+            messages = [str(item.message) for item in captured_warnings]
+            self.assertNotIn(
+                "Requiring AUTH while not requiring TLS can lead to security vulnerabilities!",
+                messages,
+            )
+            self.assertNotIn(
+                "auth_required == True but auth_require_tls == False",
+                [record.getMessage() for record in records],
+            )
+        finally:
+            mail_log.removeHandler(handler)
+            mail_log.setLevel(old_level)
             await auth_server.stop()
 
     async def test_require_tls_refuses_start_until_tls_is_configured(self):

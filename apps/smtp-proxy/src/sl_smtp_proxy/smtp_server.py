@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import hmac
 import logging
 import socket
 import ssl
 import time
+import warnings
 from typing import Optional
 
 from aiosmtpd.controller import Controller
-from aiosmtpd.smtp import AuthResult, LoginPassword
+from aiosmtpd.smtp import AuthResult, LoginPassword, SMTP
 from alias_routing_core import normalize_email_address
 
 from .config import SmtpProxyConfig
@@ -22,6 +24,46 @@ from .safety_verifier import verify_post_transform_safety, visible_recipient_cou
 
 LOGGER = logging.getLogger(__name__)
 TLS_MODES = {"starttls", "implicit"}
+AIOSMTPD_AUTH_TLS_WARNING = (
+    "Requiring AUTH while not requiring TLS can lead to security vulnerabilities!"
+)
+AIOSMTPD_AUTH_TLS_LOG_WARNING = "auth_required == True but auth_require_tls == False"
+
+
+class _SmtpProxyController(Controller):
+    def __init__(self, *args, suppress_auth_tls_warning: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._suppress_auth_tls_warning = suppress_auth_tls_warning
+
+    def factory(self):
+        if not self._suppress_auth_tls_warning:
+            return SMTP(self.handler, **self.SMTP_kwargs)
+
+        with _suppress_aiosmtpd_auth_tls_warning():
+            return SMTP(self.handler, **self.SMTP_kwargs)
+
+
+class _AiosmtpdAuthTlsWarningFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.getMessage() != AIOSMTPD_AUTH_TLS_LOG_WARNING
+
+
+@contextmanager
+def _suppress_aiosmtpd_auth_tls_warning():
+    mail_logger = logging.getLogger("mail.log")
+    log_filter = _AiosmtpdAuthTlsWarningFilter()
+    mail_logger.addFilter(log_filter)
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=AIOSMTPD_AUTH_TLS_WARNING,
+                category=UserWarning,
+                module="aiosmtpd.smtp",
+            )
+            yield
+    finally:
+        mail_logger.removeFilter(log_filter)
 
 
 class SmtpProxyHandler:
@@ -221,7 +263,7 @@ class SmtpProxyServer:
             _tls_settings(self.config)
         )
 
-        self._controller = Controller(
+        self._controller = _SmtpProxyController(
             self.handler,
             hostname=self.config.host,
             port=_resolve_listen_port(self.config.host, self.config.port),
@@ -237,6 +279,12 @@ class SmtpProxyServer:
             authenticator=_authenticator(self.config) if self.config.require_auth else None,
             auth_exclude_mechanism=_excluded_auth_mechanisms(self.config),
             command_call_limit={"RCPT": 500, "NOOP": 20, "RSET": 20, "*": 100},
+            suppress_auth_tls_warning=_suppress_auth_tls_warning(
+                self.config,
+                controller_ssl_context,
+                smtp_tls_context,
+                auth_require_tls,
+            ),
         )
         self._controller.start()
 
@@ -370,6 +418,21 @@ def _tls_context(config: SmtpProxyConfig) -> Optional[ssl.SSLContext]:
         keyfile=config.tls_key_file,
     )
     return context
+
+
+def _suppress_auth_tls_warning(
+    config: SmtpProxyConfig,
+    controller_ssl_context: Optional[ssl.SSLContext],
+    smtp_tls_context: Optional[ssl.SSLContext],
+    auth_require_tls: bool,
+) -> bool:
+    return (
+        config.require_auth
+        and controller_ssl_context is not None
+        and smtp_tls_context is None
+        and not auth_require_tls
+        and config.tls_mode.strip().lower() == "implicit"
+    )
 
 
 def _resolve_listen_port(host: str, port: int) -> int:

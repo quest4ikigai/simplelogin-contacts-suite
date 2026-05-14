@@ -57,7 +57,8 @@ class SmtpProxyConfig:
     upstream_port: int = 1025
     upstream_username: str = ""
     upstream_password: str = ""
-    upstream_starttls: bool = False
+    upstream_tls_mode: str = "none"
+    upstream_tls_verify: bool = True
     upstream_timeout_seconds: int = 30
 
     user_mailboxes: Set[str] = field(default_factory=set)
@@ -123,7 +124,8 @@ def load_config_from_env() -> SmtpProxyConfig:
         upstream_port=env_int("UPSTREAM_SMTP_PORT", 1025),
         upstream_username=os.environ.get("UPSTREAM_SMTP_USERNAME", ""),
         upstream_password=os.environ.get("UPSTREAM_SMTP_PASSWORD", ""),
-        upstream_starttls=env_bool("UPSTREAM_SMTP_STARTTLS", False),
+        upstream_tls_mode=os.environ.get("UPSTREAM_SMTP_TLS_MODE", "none"),
+        upstream_tls_verify=env_bool("UPSTREAM_SMTP_TLS_VERIFY", True),
         upstream_timeout_seconds=env_int("UPSTREAM_SMTP_TIMEOUT_SECONDS", 30),
         user_mailboxes=set(env_csv("USER_MAILBOXES")),
         manual_simplelogin_aliases=set(env_csv("MANUAL_SIMPLELOGIN_ALIASES")),
