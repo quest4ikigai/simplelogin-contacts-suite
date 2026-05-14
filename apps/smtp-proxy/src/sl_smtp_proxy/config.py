@@ -7,6 +7,10 @@ from typing import Iterable, List, Optional, Set
 from alias_routing_core import RoutingContext
 
 
+class SecretFileError(RuntimeError):
+    pass
+
+
 def env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -31,6 +35,26 @@ def env_float(name: str, default: float) -> float:
 def env_csv(name: str) -> List[str]:
     raw = os.environ.get(name, "")
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def env_secret(name: str, default: str = "") -> str:
+    raw = os.environ.get(name)
+    if raw is not None and raw != "":
+        return raw
+
+    file_var = f"{name}_FILE"
+    file_path = os.environ.get(file_var)
+    if file_path is None or file_path == "":
+        return default
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as secret_file:
+            return secret_file.read().rstrip("\r\n")
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+        raise SecretFileError(
+            f"Unable to read secret file configured by {file_var}: {reason}"
+        ) from exc
 
 
 @dataclass
@@ -106,13 +130,13 @@ class SmtpProxyConfig:
 def load_config_from_env() -> SmtpProxyConfig:
     return SmtpProxyConfig(
         simplelogin_base_url=os.environ.get("SIMPLELOGIN_BASE_URL", "https://app.simplelogin.io"),
-        simplelogin_api_key=os.environ.get("SIMPLELOGIN_API_KEY", ""),
+        simplelogin_api_key=env_secret("SIMPLELOGIN_API_KEY", ""),
         simplelogin_timeout_seconds=env_int("SIMPLELOGIN_TIMEOUT_SECONDS", 30),
         host=os.environ.get("SMTP_PROXY_HOST", "127.0.0.1"),
         port=env_int("SMTP_PROXY_PORT", 2525),
         require_auth=env_bool("SMTP_PROXY_REQUIRE_AUTH", True),
         username=os.environ.get("SMTP_PROXY_USERNAME", "user"),
-        password=os.environ.get("SMTP_PROXY_PASSWORD", "change-me"),
+        password=env_secret("SMTP_PROXY_PASSWORD", "change-me"),
         require_tls=env_bool("SMTP_PROXY_REQUIRE_TLS", False),
         tls_mode=os.environ.get("SMTP_PROXY_TLS_MODE", "starttls"),
         tls_cert_file=os.environ.get("SMTP_PROXY_TLS_CERT_FILE", ""),
@@ -125,7 +149,7 @@ def load_config_from_env() -> SmtpProxyConfig:
         upstream_host=os.environ.get("UPSTREAM_SMTP_HOST", "host.docker.internal"),
         upstream_port=env_int("UPSTREAM_SMTP_PORT", 1025),
         upstream_username=os.environ.get("UPSTREAM_SMTP_USERNAME", ""),
-        upstream_password=os.environ.get("UPSTREAM_SMTP_PASSWORD", ""),
+        upstream_password=env_secret("UPSTREAM_SMTP_PASSWORD", ""),
         upstream_tls_mode=os.environ.get("UPSTREAM_SMTP_TLS_MODE", "none"),
         upstream_tls_verify=env_bool("UPSTREAM_SMTP_TLS_VERIFY", True),
         upstream_timeout_seconds=env_int("UPSTREAM_SMTP_TIMEOUT_SECONDS", 30),

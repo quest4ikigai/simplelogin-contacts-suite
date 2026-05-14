@@ -42,6 +42,35 @@ USER_MAILBOXES=user@example.com
 ALIAS_SUFFIX_DOMAINS=@example.net,@subdomain.simplelogin.example,.suffix@simplelogin.example
 ```
 
+Secret values can also be read from mounted files. Direct variables take
+precedence when both forms are set, so leave the direct value empty or unset
+when using the `_FILE` variant:
+
+```dotenv
+SIMPLELOGIN_API_KEY=
+SIMPLELOGIN_API_KEY_FILE=/run/secrets/simplelogin-smtp-proxy/simplelogin_api_key
+SMTP_PROXY_PASSWORD=
+SMTP_PROXY_PASSWORD_FILE=/run/secrets/simplelogin-smtp-proxy/smtp_proxy_password
+UPSTREAM_SMTP_PASSWORD=
+UPSTREAM_SMTP_PASSWORD_FILE=/run/secrets/simplelogin-smtp-proxy/upstream_smtp_password
+```
+
+Create the local secret files and mount the directory read-only:
+
+```bash
+mkdir -p secrets
+printf '%s\n' 'your-simplelogin-api-key' > secrets/simplelogin_api_key
+printf '%s\n' 'your-proxy-smtp-password' > secrets/smtp_proxy_password
+printf '%s\n' 'your-upstream-smtp-password' > secrets/upstream_smtp_password
+chmod 600 secrets/*
+```
+
+Then uncomment this volume in `docker-compose.smtp-proxy.yml`:
+
+```yaml
+- ./secrets:/run/secrets/simplelogin-smtp-proxy:ro
+```
+
 You do not need to list every SimpleLogin alias. The proxy discovers your owned
 aliases from the SimpleLogin API and stores them in the SQLite cache at
 `CACHE_PATH`. Use `MANUAL_SIMPLELOGIN_ALIASES` only for temporary local
