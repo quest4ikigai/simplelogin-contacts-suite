@@ -58,8 +58,6 @@ class SmtpProxyConfig:
     alias_suffix_domains: Set[str] = field(default_factory=set)
 
     fail_closed: bool = True
-    rewrite_headers: bool = True
-    rewrite_envelope: bool = True
     keep_unknown_simplelogin_addresses: bool = True
     strip_own_aliases: bool = True
     strip_own_mailboxes: bool = True
@@ -123,8 +121,6 @@ def load_config_from_env() -> SmtpProxyConfig:
         known_reverse_aliases=set(env_csv("KNOWN_REVERSE_ALIASES")),
         alias_suffix_domains=set(env_csv("ALIAS_SUFFIX_DOMAINS")),
         fail_closed=env_bool("FAIL_CLOSED", True),
-        rewrite_headers=env_bool("REWRITE_HEADERS", True),
-        rewrite_envelope=env_bool("REWRITE_ENVELOPE", True),
         keep_unknown_simplelogin_addresses=env_bool("KEEP_UNKNOWN_SIMPLELOGIN_ADDRESSES", True),
         strip_own_aliases=env_bool("STRIP_OWN_ALIASES", True),
         strip_own_mailboxes=env_bool("STRIP_OWN_MAILBOXES", True),

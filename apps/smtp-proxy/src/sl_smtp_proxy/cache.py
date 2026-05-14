@@ -141,6 +141,35 @@ class SQLiteAliasCache:
             return None
         return row[0], bool(row[1])
 
+    def contact_needs_refresh(
+        self,
+        alias_id: str,
+        contact_email: str,
+        ttl_seconds: int,
+    ) -> bool:
+        if ttl_seconds <= 0:
+            return True
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT updated_at
+                FROM contacts
+                WHERE alias_id = ? AND contact_email = ?
+                """,
+                (alias_id, contact_email.casefold()),
+            ).fetchone()
+        if not row or not row[0]:
+            return True
+
+        try:
+            last_refresh = datetime.fromisoformat(row[0])
+        except ValueError:
+            return True
+        if last_refresh.tzinfo is None:
+            last_refresh = last_refresh.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - last_refresh > timedelta(seconds=ttl_seconds)
+
     def find_reverse_alias(self, alias_id: str, contact_email: str) -> Optional[str]:
         row = self.find_contact(alias_id, contact_email)
         if not row:

@@ -18,5 +18,3 @@ Remaining major work:
 - Wire SimpleLogin client and cache into the SMTP proxy send path.
 - Add full fake SimpleLogin and fake upstream SMTP integration tests.
 - Add hardening features such as throttling and health checks.
-
-The original detailed plan lives in `docs/plans/07-IMPLEMENTATION-MILESTONES.md`.

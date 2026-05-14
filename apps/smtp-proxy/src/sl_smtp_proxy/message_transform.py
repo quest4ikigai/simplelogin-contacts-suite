@@ -163,11 +163,10 @@ def rewrite_address_header(message: Message, header_name: str, plan: TransformPl
 
 def apply_transform(message: Message, plan: TransformPlan, config: SmtpProxyConfig) -> Message:
     remove_control_headers(message)
-    if config.rewrite_headers:
-        rewrite_address_header(message, "To", plan)
-        rewrite_address_header(message, "Cc", plan)
-        if message.get("Bcc") is not None:
-            del message["Bcc"]
+    rewrite_address_header(message, "To", plan)
+    rewrite_address_header(message, "Cc", plan)
+    if message.get("Bcc") is not None:
+        del message["Bcc"]
     return message
 
 

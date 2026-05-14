@@ -12,7 +12,6 @@ SimpleLogin reverse aliases into Nextcloud Contacts.
 - `docker-compose.full.yml`: SMTP proxy plus the optional Nextcloud contacts sync.
 - `.env.smtp-proxy.example`: SMTP proxy environment template.
 - `.env.server-sync.example`: Nextcloud contacts sync environment template.
-- `caddy.example.Caddyfile`: note for future HTTP admin endpoints, not SMTP TLS.
 
 ## Simple Step-By-Step Usage
 
@@ -58,6 +57,9 @@ SMTP_PROXY_DRY_RUN=true
 docker compose -f docker-compose.smtp-proxy.yml up -d --build
 docker logs -f simplelogin-smtp-proxy
 ```
+
+The `smtp-proxy` service includes a Docker healthcheck that connects to the
+local SMTP listener and verifies it returns a ready banner.
 
 5. Send a dry-run test message through the proxy. The message should be rejected
    after a redacted transform summary is logged.
@@ -217,8 +219,6 @@ SMTP_PROXY_REQUIRE_AUTH=true
 SMTP_PROXY_DRY_RUN=true
 SMTP_PROXY_AUTH_LOGIN_ENABLED=true
 FAIL_CLOSED=true
-REWRITE_HEADERS=true
-REWRITE_ENVELOPE=true
 KEEP_UNKNOWN_SIMPLELOGIN_ADDRESSES=true
 STRIP_OWN_ALIASES=true
 STRIP_OWN_MAILBOXES=true

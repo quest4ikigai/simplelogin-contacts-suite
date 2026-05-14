@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.abspath(CORE_SRC))
 sys.path.insert(0, os.path.abspath(SIMPLELOGIN_SRC))
 
 from sl_smtp_proxy.config import SmtpProxyConfig
+from sl_smtp_proxy.healthcheck import check_health
 from sl_smtp_proxy.smtp_server import SmtpProxyServer
 from alias_routing_core import TransformAction
 
@@ -116,6 +117,16 @@ def submit_message(port, msg, rcpt_tos, mail_from="sender@example.com"):
         return read_smtp_response(fileobj)
 
 
+def mail_from_response(port, mail_from="sender@example.com"):
+    with socket.create_connection(("127.0.0.1", port), timeout=2) as sock:
+        fileobj = sock.makefile("rwb", buffering=0)
+        read_smtp_response(fileobj)
+        send_smtp_line(fileobj, "EHLO test.local")
+        read_smtp_response(fileobj)
+        send_smtp_line(fileobj, f"MAIL FROM:<{mail_from}>")
+        return read_smtp_response(fileobj)
+
+
 class CaptureUpstreamHandler:
     def __init__(self):
         self.messages = []
@@ -164,6 +175,61 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[0], 550)
         self.assertIn("SimpleLogin alias selection required", result[1])
         self.assertTrue(self.server.last_plan.rejected)
+
+    async def test_healthcheck_passes_for_running_server(self):
+        check_health(
+            SmtpProxyConfig(
+                host="127.0.0.1",
+                port=self.server.port,
+                require_auth=False,
+            ),
+            timeout_seconds=2,
+        )
+
+    async def test_mail_from_rejects_sender_outside_user_mailboxes(self):
+        sender_server = SmtpProxyServer(
+            SmtpProxyConfig(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                user_mailboxes={"allowed@example.com"},
+            )
+        )
+        await sender_server.start()
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                mail_from_response,
+                sender_server.port,
+                "intruder@example.com",
+            )
+
+            self.assertEqual(result[0], 550)
+            self.assertIn("Sender address is not allowed", result[1])
+        finally:
+            await sender_server.stop()
+
+    async def test_mail_from_accepts_configured_user_mailbox(self):
+        sender_server = SmtpProxyServer(
+            SmtpProxyConfig(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                user_mailboxes={"allowed@example.com"},
+            )
+        )
+        await sender_server.start()
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                mail_from_response,
+                sender_server.port,
+                "ALLOWED@example.com",
+            )
+
+            self.assertEqual(result[0], 250)
+        finally:
+            await sender_server.stop()
 
     async def test_smtp_submission_uses_injected_resolver_for_rewrite_plan(self):
         rewrite_server = SmtpProxyServer(

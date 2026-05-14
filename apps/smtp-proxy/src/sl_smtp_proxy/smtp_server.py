@@ -9,6 +9,7 @@ from typing import Optional
 
 from aiosmtpd.controller import Controller
 from aiosmtpd.smtp import AuthResult, LoginPassword
+from alias_routing_core import normalize_email_address
 
 from .config import SmtpProxyConfig
 from .forwarder import UpstreamForwardingError, UpstreamSmtpForwarder
@@ -31,6 +32,13 @@ class SmtpProxyHandler:
             else resolver_from_config(config)
         )
         self.forwarder = forwarder or UpstreamSmtpForwarder(config)
+
+    async def handle_MAIL(self, server, session, envelope, address, mail_options) -> str:
+        if not _sender_allowed(self.config, address):
+            return "550 Sender address is not allowed by SimpleLogin proxy policy"
+        envelope.mail_from = address
+        envelope.mail_options.extend(mail_options)
+        return "250 OK"
 
     async def handle_DATA(self, server, session, envelope) -> str:
         content = envelope.original_content
@@ -176,6 +184,25 @@ def _excluded_auth_mechanisms(config: SmtpProxyConfig):
     if config.auth_login_enabled:
         return []
     return ["LOGIN"]
+
+
+def _sender_allowed(config: SmtpProxyConfig, sender: str) -> bool:
+    if not config.user_mailboxes:
+        return True
+
+    normalized_sender = normalize_email_address(sender or "")
+    if not normalized_sender:
+        return False
+
+    allowed = {
+        normalized
+        for normalized in (
+            normalize_email_address(mailbox)
+            for mailbox in config.user_mailboxes
+        )
+        if normalized
+    }
+    return normalized_sender in allowed
 
 
 def _tls_settings(config: SmtpProxyConfig):

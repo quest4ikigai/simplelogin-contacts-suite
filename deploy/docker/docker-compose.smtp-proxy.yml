@@ -12,6 +12,12 @@ services:
       - smtp_proxy_data:/data
       # Uncomment after placing proxy TLS cert/key files under deploy/docker/certs.
       # - ./certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "python", "-m", "sl_smtp_proxy.healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   fake-upstream:
     image: python:3.12-slim

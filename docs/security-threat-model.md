@@ -10,5 +10,3 @@ conservative:
 - Never log message bodies, attachments, subjects, API keys, or SMTP passwords
   by default.
 - Strip `X-SimpleLogin-*` internal metadata headers before any future forwarding.
-
-The original detailed plan lives in `docs/plans/06-SECURITY-THREAT-MODEL.md`.
