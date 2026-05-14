@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import logging
 import smtplib
+import ssl
 from email import policy
 from email.message import Message
-from typing import Iterable
+from typing import Iterable, Optional
 
 from .config import SmtpProxyConfig
 
 
 LOGGER = logging.getLogger(__name__)
+UPSTREAM_TLS_MODES = {"none", "starttls", "implicit"}
 
 
 class UpstreamForwardingError(RuntimeError):
@@ -27,15 +29,14 @@ class UpstreamSmtpForwarder:
         if not recipient_list:
             raise UpstreamForwardingError("No deliverable recipients after SimpleLogin routing")
 
+        tls_mode = _upstream_tls_mode(self.config)
+        tls_context = _upstream_tls_context(self.config) if tls_mode != "none" else None
+
         try:
-            with smtplib.SMTP(
-                self.config.upstream_host,
-                self.config.upstream_port,
-                timeout=self.config.upstream_timeout_seconds,
-            ) as smtp:
+            with _connect_upstream(self.config, tls_mode, tls_context) as smtp:
                 smtp.ehlo()
-                if self.config.upstream_starttls:
-                    smtp.starttls()
+                if tls_mode == "starttls":
+                    smtp.starttls(context=tls_context)
                     smtp.ehlo()
                 if self.config.upstream_username or self.config.upstream_password:
                     smtp.login(self.config.upstream_username, self.config.upstream_password)
@@ -46,10 +47,11 @@ class UpstreamSmtpForwarder:
                 )
         except (OSError, smtplib.SMTPException) as exc:
             LOGGER.warning(
-                "upstream_smtp_forward_failed host=%s port=%s starttls=%s auth_configured=%s error_type=%s error=%s",
+                "upstream_smtp_forward_failed host=%s port=%s tls_mode=%s tls_verify=%s auth_configured=%s error_type=%s error=%s",
                 self.config.upstream_host,
                 self.config.upstream_port,
-                self.config.upstream_starttls,
+                tls_mode,
+                self.config.upstream_tls_verify,
                 bool(self.config.upstream_username or self.config.upstream_password),
                 type(exc).__name__,
                 _safe_error_message(exc),
@@ -57,6 +59,43 @@ class UpstreamSmtpForwarder:
             raise UpstreamForwardingError(
                 "Upstream SMTP unavailable. Message not sent to avoid unsafe delivery."
             ) from exc
+
+
+def _connect_upstream(
+    config: SmtpProxyConfig,
+    tls_mode: str,
+    tls_context: Optional[ssl.SSLContext],
+):
+    if tls_mode == "implicit":
+        return smtplib.SMTP_SSL(
+            config.upstream_host,
+            config.upstream_port,
+            timeout=config.upstream_timeout_seconds,
+            context=tls_context,
+        )
+
+    return smtplib.SMTP(
+        config.upstream_host,
+        config.upstream_port,
+        timeout=config.upstream_timeout_seconds,
+    )
+
+
+def _upstream_tls_mode(config: SmtpProxyConfig) -> str:
+    tls_mode = config.upstream_tls_mode.strip().lower()
+    if tls_mode not in UPSTREAM_TLS_MODES:
+        raise UpstreamForwardingError(
+            "Invalid upstream SMTP TLS mode. Use 'none', 'starttls', or 'implicit'."
+        )
+    return tls_mode
+
+
+def _upstream_tls_context(config: SmtpProxyConfig) -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    if not config.upstream_tls_verify:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return context
 
 
 def _safe_error_message(exc: BaseException) -> str:

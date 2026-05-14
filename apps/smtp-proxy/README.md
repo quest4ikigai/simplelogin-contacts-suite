@@ -30,6 +30,22 @@ Forwarding is disabled by default via `SMTP_PROXY_DRY_RUN=true`. Leave dry-run
 enabled until fake-upstream or disposable-account tests prove your configuration
 rewrites every external recipient as expected.
 
+For upstream SMTP delivery, configure the real SMTP server and TLS mode:
+
+```dotenv
+UPSTREAM_SMTP_HOST=smtp.example.com
+UPSTREAM_SMTP_PORT=587
+UPSTREAM_SMTP_USERNAME=...
+UPSTREAM_SMTP_PASSWORD=...
+UPSTREAM_SMTP_TLS_MODE=starttls
+UPSTREAM_SMTP_TLS_VERIFY=true
+```
+
+`UPSTREAM_SMTP_TLS_MODE` accepts `none`, `starttls`, or `implicit`. STARTTLS and
+implicit TLS use a verifying SSL context by default. Set
+`UPSTREAM_SMTP_TLS_VERIFY=false` only for a trusted upstream with a self-signed
+certificate.
+
 For remote mail clients, configure inbound proxy TLS with:
 
 ```dotenv
