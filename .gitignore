@@ -10,3 +10,5 @@ __pycache__/
 apps/server-sync/__pycache__/
 deploy/docker/smtp-captures/
 docs/plans
+.codex
+.claude
