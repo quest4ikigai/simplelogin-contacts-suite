@@ -98,6 +98,14 @@ docker logs -f simplelogin-smtp-proxy
 The `smtp-proxy` service includes a Docker healthcheck that connects to the
 local SMTP listener and verifies it returns a ready banner.
 
+Docker applies healthcheck changes only when the container is created. If
+`docker inspect simplelogin-smtp-proxy --format '{{json .State.Health}}'`
+prints `null`, recreate the service after pulling this compose file:
+
+```bash
+docker compose -f docker-compose.smtp-proxy.yml up -d --build --force-recreate smtp-proxy
+```
+
 5. Send a dry-run test message through the proxy. The message should be rejected
    after a redacted transform summary is logged.
 
@@ -308,6 +316,63 @@ Use normal Docker logs to inspect them:
 ```bash
 docker logs simplelogin-smtp-proxy
 ```
+
+## Healthcheck History And Alerts
+
+Docker stores a small rolling history of healthcheck executions on the
+container. This is useful for the most recent failure, but it is not a durable
+multi-day log and healthcheck output is not copied into `docker logs`.
+
+Inspect Docker's native health state:
+
+```bash
+docker inspect --format '{{json .State.Health}}' simplelogin-smtp-proxy | jq .
+```
+
+Print the recent native healthcheck outputs:
+
+```bash
+docker inspect --format '{{range .State.Health.Log}}{{.Start}} exit={{.ExitCode}} {{.Output}}{{println}}{{end}}' simplelogin-smtp-proxy
+```
+
+The proxy also writes durable JSONL health history to the `/data` volume by
+default:
+
+```bash
+docker exec simplelogin-smtp-proxy sh -c 'tail -n 100 /data/healthcheck.jsonl'
+```
+
+If the container is stopped or has been removed but the volume still exists,
+inspect the volume directly. The default compose project name for this folder is
+`docker`, so the volume is usually `docker_smtp_proxy_data`:
+
+```bash
+docker run --rm -v docker_smtp_proxy_data:/data busybox tail -n 100 /data/healthcheck.jsonl
+```
+
+The history file rotates to `/data/healthcheck.jsonl.1` when it reaches
+`SMTP_PROXY_HEALTHCHECK_HISTORY_MAX_BYTES`, which defaults to 5 MiB.
+The Docker healthcheck timeout is intentionally longer than
+`SMTP_PROXY_HEALTHCHECK_TIMEOUT_SECONDS` so timeout failures can still be
+recorded before Docker stops the probe process.
+
+To have the healthcheck send one alert after the same three consecutive failures
+used by the compose healthcheck, set these values in `.env`:
+
+```dotenv
+SMTP_PROXY_HEALTHCHECK_PUSHOVER_ENABLED=true
+SMTP_PROXY_HEALTHCHECK_ALERT_AFTER_FAILURES=3
+SMTP_PROXY_HEALTHCHECK_PUSHOVER_RECOVERY_ENABLED=true
+PUSHOVER_APP_TOKEN=...
+PUSHOVER_USER_KEY=...
+PUSHOVER_DEVICE=
+PUSHOVER_PRIORITY=0
+PUSHOVER_TIMEOUT_SECONDS=5
+```
+
+`PUSHOVER_APP_TOKEN_FILE` and `PUSHOVER_USER_KEY_FILE` are also supported for
+file-backed secrets. The unhealthy alert is sent once per failure episode; a
+recovery alert is sent after the next successful healthcheck.
 
 ## Cache Backup And Restore
 
