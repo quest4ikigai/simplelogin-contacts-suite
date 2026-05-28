@@ -317,7 +317,7 @@ Use normal Docker logs to inspect them:
 docker logs simplelogin-smtp-proxy
 ```
 
-## Healthcheck History And Alerts
+## Healthcheck History And Uptime Kuma Monitoring
 
 Docker stores a small rolling history of healthcheck executions on the
 container. This is useful for the most recent failure, but it is not a durable
@@ -356,23 +356,30 @@ The Docker healthcheck timeout is intentionally longer than
 `SMTP_PROXY_HEALTHCHECK_TIMEOUT_SECONDS` so timeout failures can still be
 recorded before Docker stops the probe process.
 
-To have the healthcheck send one alert after the same three consecutive failures
-used by the compose healthcheck, set these values in `.env`:
+Use Uptime Kuma as the notification layer instead of putting notification
+credentials in the SMTP proxy. Recommended monitors:
 
-```dotenv
-SMTP_PROXY_HEALTHCHECK_PUSHOVER_ENABLED=true
-SMTP_PROXY_HEALTHCHECK_ALERT_AFTER_FAILURES=3
-SMTP_PROXY_HEALTHCHECK_PUSHOVER_RECOVERY_ENABLED=true
-PUSHOVER_APP_TOKEN=...
-PUSHOVER_USER_KEY=...
-PUSHOVER_DEVICE=
-PUSHOVER_PRIORITY=0
-PUSHOVER_TIMEOUT_SECONDS=5
+- Docker Container monitor for `simplelogin-smtp-proxy`, using the Docker
+  health state produced by this compose healthcheck.
+- TCP Port monitor against the host and port your mail clients use, such as the
+  VPN/LAN hostname on port `2525`.
+
+For a Docker Container monitor, Uptime Kuma needs access to the Docker daemon,
+commonly by mounting `/var/run/docker.sock` into the Uptime Kuma container. That
+socket grants broad control over Docker, so keep Uptime Kuma private to your VPN
+or trusted LAN and do not expose it to the public internet when using Docker
+monitoring. See the Uptime Kuma Docker monitor guide:
+
+```text
+https://github.com/louislam/uptime-kuma/wiki/How-to-Monitor-Docker-Containers
 ```
 
-`PUSHOVER_APP_TOKEN_FILE` and `PUSHOVER_USER_KEY_FILE` are also supported for
-file-backed secrets. The unhealthy alert is sent once per failure episode; a
-recovery alert is sent after the next successful healthcheck.
+Configure Pushover in Uptime Kuma's notification settings, then attach that
+notification to the Docker Container and TCP Port monitors. If Uptime Kuma runs
+on the same headless server, it can detect proxy/container failures but cannot
+notify you when the whole server, Docker host, or network path is down. For that
+failure mode, run Uptime Kuma somewhere outside the server's failure domain or
+add an external monitor for the server/VPN endpoint.
 
 ## Cache Backup And Restore
 

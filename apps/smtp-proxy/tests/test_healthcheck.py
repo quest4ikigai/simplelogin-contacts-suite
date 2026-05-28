@@ -14,7 +14,7 @@ from sl_smtp_proxy.healthcheck import HealthcheckSettings, load_healthcheck_sett
 
 
 class HealthcheckHistoryTests(unittest.TestCase):
-    def test_result_is_written_to_history_and_failure_state(self):
+    def test_result_is_written_to_history(self):
         with tempfile.TemporaryDirectory() as tempdir:
             settings = self._settings(tempdir)
 
@@ -30,89 +30,44 @@ class HealthcheckHistoryTests(unittest.TestCase):
 
             with open(settings.history_path, "r", encoding="utf-8") as history_file:
                 rows = [json.loads(line) for line in history_file]
-            with open(settings.state_path, "r", encoding="utf-8") as state_file:
-                state = json.load(state_file)
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "failed")
-        self.assertEqual(rows[0]["consecutive_failures"], 1)
-        self.assertEqual(state["consecutive_failures"], 1)
 
-    def test_pushover_alert_is_sent_once_then_recovery_is_sent(self):
-        sent = []
-
-        def fake_sender(settings, title, message):
-            sent.append((title, message))
-
+    def test_settings_load_history_paths_from_env(self):
         with tempfile.TemporaryDirectory() as tempdir:
-            settings = self._settings(
-                tempdir,
-                alert_after_failures=2,
-                pushover_enabled=True,
-                pushover_app_token="app-token",
-                pushover_user_key="user-key",
-            )
-
-            record_healthcheck_result(settings, self._failed_event("first"), alert_sender=fake_sender)
-            record_healthcheck_result(settings, self._failed_event("second"), alert_sender=fake_sender)
-            record_healthcheck_result(settings, self._failed_event("third"), alert_sender=fake_sender)
-            record_healthcheck_result(
-                settings,
-                {
-                    "timestamp": "2026-05-26T12:03:00Z",
-                    "status": "ok",
-                    "exit_code": 0,
-                    "message": "healthcheck ok",
-                },
-                alert_sender=fake_sender,
-            )
-
-        self.assertEqual(len(sent), 2)
-        self.assertIn("failed 2 consecutive times", sent[0][1])
-        self.assertIn("recovered", sent[1][1])
-
-    def test_settings_support_secret_files_for_pushover_credentials(self):
-        with tempfile.TemporaryDirectory() as tempdir:
-            token_file = os.path.join(tempdir, "pushover-token")
-            user_file = os.path.join(tempdir, "pushover-user")
-            self._write(token_file, "file-app-token\n")
-            self._write(user_file, "file-user-key\n")
+            history_path = os.path.join(tempdir, "custom-healthcheck.jsonl")
 
             with mock.patch.dict(
                 os.environ,
                 {
-                    "SMTP_PROXY_HEALTHCHECK_PUSHOVER_ENABLED": "true",
-                    "PUSHOVER_APP_TOKEN_FILE": token_file,
-                    "PUSHOVER_USER_KEY_FILE": user_file,
-                    "PUSHOVER_DEVICE": "phone",
+                    "SMTP_PROXY_HEALTHCHECK_HISTORY_PATH": history_path,
+                    "SMTP_PROXY_HEALTHCHECK_HISTORY_MAX_BYTES": "1234",
                 },
                 clear=True,
             ):
                 settings = load_healthcheck_settings_from_env()
 
-        self.assertTrue(settings.pushover_enabled)
-        self.assertEqual(settings.pushover_app_token, "file-app-token")
-        self.assertEqual(settings.pushover_user_key, "file-user-key")
-        self.assertEqual(settings.pushover_device, "phone")
+        self.assertEqual(settings.history_path, history_path)
+        self.assertEqual(settings.history_max_bytes, 1234)
 
-    def test_bad_pushover_secret_file_does_not_raise_during_settings_load(self):
-        with mock.patch.dict(
-            os.environ,
-            {
-                "SMTP_PROXY_HEALTHCHECK_PUSHOVER_ENABLED": "true",
-                "PUSHOVER_APP_TOKEN_FILE": "/path/that/does/not/exist",
-            },
-            clear=True,
-        ):
-            settings = load_healthcheck_settings_from_env()
+    def test_history_rotates_when_max_bytes_is_reached(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            settings = self._settings(tempdir, history_max_bytes=1)
+            record_healthcheck_result(settings, self._failed_event("first"))
+            record_healthcheck_result(settings, self._failed_event("second"))
 
-        self.assertTrue(settings.pushover_enabled)
-        self.assertIn("PUSHOVER_APP_TOKEN_FILE", settings.pushover_config_error)
+            with open(settings.history_path, "r", encoding="utf-8") as history_file:
+                current_rows = [json.loads(line) for line in history_file]
+            with open(f"{settings.history_path}.1", "r", encoding="utf-8") as rotated_file:
+                rotated_rows = [json.loads(line) for line in rotated_file]
+
+        self.assertEqual(current_rows[0]["message"], "healthcheck failed: second")
+        self.assertEqual(rotated_rows[0]["message"], "healthcheck failed: first")
 
     def _settings(self, tempdir, **overrides):
         kwargs = {
             "history_path": os.path.join(tempdir, "healthcheck.jsonl"),
-            "state_path": os.path.join(tempdir, "healthcheck-state.json"),
         }
         kwargs.update(overrides)
         return HealthcheckSettings(**kwargs)
@@ -124,10 +79,6 @@ class HealthcheckHistoryTests(unittest.TestCase):
             "exit_code": 1,
             "message": f"healthcheck failed: {detail}",
         }
-
-    def _write(self, path, value):
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(value)
 
 
 if __name__ == "__main__":
