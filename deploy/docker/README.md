@@ -98,6 +98,14 @@ docker logs -f simplelogin-smtp-proxy
 The `smtp-proxy` service includes a Docker healthcheck that connects to the
 local SMTP listener and verifies it returns a ready banner.
 
+Docker applies healthcheck changes only when the container is created. If
+`docker inspect simplelogin-smtp-proxy --format '{{json .State.Health}}'`
+prints `null`, recreate the service after pulling this compose file:
+
+```bash
+docker compose -f docker-compose.smtp-proxy.yml up -d --build --force-recreate smtp-proxy
+```
+
 5. Send a dry-run test message through the proxy. The message should be rejected
    after a redacted transform summary is logged.
 
@@ -308,6 +316,70 @@ Use normal Docker logs to inspect them:
 ```bash
 docker logs simplelogin-smtp-proxy
 ```
+
+## Healthcheck History And Uptime Kuma Monitoring
+
+Docker stores a small rolling history of healthcheck executions on the
+container. This is useful for the most recent failure, but it is not a durable
+multi-day log and healthcheck output is not copied into `docker logs`.
+
+Inspect Docker's native health state:
+
+```bash
+docker inspect --format '{{json .State.Health}}' simplelogin-smtp-proxy | jq .
+```
+
+Print the recent native healthcheck outputs:
+
+```bash
+docker inspect --format '{{range .State.Health.Log}}{{.Start}} exit={{.ExitCode}} {{.Output}}{{println}}{{end}}' simplelogin-smtp-proxy
+```
+
+The proxy also writes durable JSONL health history to the `/data` volume by
+default:
+
+```bash
+docker exec simplelogin-smtp-proxy sh -c 'tail -n 100 /data/healthcheck.jsonl'
+```
+
+If the container is stopped or has been removed but the volume still exists,
+inspect the volume directly. The default compose project name for this folder is
+`docker`, so the volume is usually `docker_smtp_proxy_data`:
+
+```bash
+docker run --rm -v docker_smtp_proxy_data:/data busybox tail -n 100 /data/healthcheck.jsonl
+```
+
+The history file rotates to `/data/healthcheck.jsonl.1` when it reaches
+`SMTP_PROXY_HEALTHCHECK_HISTORY_MAX_BYTES`, which defaults to 5 MiB.
+The Docker healthcheck timeout is intentionally longer than
+`SMTP_PROXY_HEALTHCHECK_TIMEOUT_SECONDS` so timeout failures can still be
+recorded before Docker stops the probe process.
+
+Use Uptime Kuma as the notification layer instead of putting notification
+credentials in the SMTP proxy. Recommended monitors:
+
+- Docker Container monitor for `simplelogin-smtp-proxy`, using the Docker
+  health state produced by this compose healthcheck.
+- TCP Port monitor against the host and port your mail clients use, such as the
+  VPN/LAN hostname on port `2525`.
+
+For a Docker Container monitor, Uptime Kuma needs access to the Docker daemon,
+commonly by mounting `/var/run/docker.sock` into the Uptime Kuma container. That
+socket grants broad control over Docker, so keep Uptime Kuma private to your VPN
+or trusted LAN and do not expose it to the public internet when using Docker
+monitoring. See the Uptime Kuma Docker monitor guide:
+
+```text
+https://github.com/louislam/uptime-kuma/wiki/How-to-Monitor-Docker-Containers
+```
+
+Configure Pushover in Uptime Kuma's notification settings, then attach that
+notification to the Docker Container and TCP Port monitors. If Uptime Kuma runs
+on the same headless server, it can detect proxy/container failures but cannot
+notify you when the whole server, Docker host, or network path is down. For that
+failure mode, run Uptime Kuma somewhere outside the server's failure domain or
+add an external monitor for the server/VPN endpoint.
 
 ## Cache Backup And Restore
 
