@@ -124,12 +124,15 @@ def _replacement_for(original: str, plan: TransformPlan) -> Tuple[Optional[str],
     for item in plan.actions:
         if normalize_email_address(item.original) != normalized_original:
             continue
-        if item.action == TransformAction.DROP:
-            return None, True
         if item.action == TransformAction.REWRITE:
             return item.replacement, True
         if item.action == TransformAction.KEEP:
             return original, True
+        # DROP, REJECT, and any other non-deliverable action must never
+        # surface the original literal address in a rewritten header: an
+        # address the plan didn't clear for delivery must not leak into
+        # visible headers just because it also wasn't explicitly dropped.
+        return None, True
     return original, False
 
 

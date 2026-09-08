@@ -81,6 +81,8 @@ def _unsafe_settings(config: SmtpProxyConfig) -> List[UnsafeSetting]:
         settings.append(UnsafeSetting("USER_MAILBOXES", "must not be empty"))
     if config.allow_direct_external_send:
         settings.append(UnsafeSetting("ALLOW_DIRECT_EXTERNAL_SEND", "must be false"))
+    if not config.fail_closed:
+        settings.append(UnsafeSetting("FAIL_CLOSED", "must be true"))
     return settings
 
 

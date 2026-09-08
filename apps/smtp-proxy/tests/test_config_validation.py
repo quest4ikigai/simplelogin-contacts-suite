@@ -106,6 +106,10 @@ class ConfigValidationTests(unittest.TestCase):
                 safe_remote_config(allow_direct_external_send=True)
             )
 
+    def test_remote_capable_bind_rejects_fail_closed_disabled(self):
+        with self.assertRaisesRegex(StartupConfigError, "FAIL_CLOSED"):
+            validate_startup_config(safe_remote_config(fail_closed=False))
+
     def test_bind_classification(self):
         for host in ("127.0.0.1", "localhost", "::1"):
             self.assertTrue(is_local_development_bind(host))

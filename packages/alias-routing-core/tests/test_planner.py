@@ -211,6 +211,64 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(plan.actions[0].action, TransformAction.KEEP)
         self.assertTrue(plan.actions[0].warning)
 
+    def test_reverse_alias_plus_new_external_recipient_in_same_header_is_rewritten(self):
+        # Regression: an already-known reverse alias and a newly added
+        # ordinary recipient can arrive together (e.g. after a reply where
+        # a reverse alias was manually moved into To). The new recipient
+        # must still be converted, not forwarded literally.
+        context = RoutingContext(
+            own_simplelogin_aliases={"shopping@example.com"},
+            known_reverse_aliases={"reply+existing@simplelogin.co"},
+        )
+
+        plan = build_transform_plan(
+            [
+                "reply+existing@simplelogin.co",
+                "newperson@example.com",
+                "shopping@example.com",
+            ],
+            context,
+            reverse_alias_resolver=resolver,
+        )
+
+        self.assertFalse(plan.rejected)
+        self.assertEqual(plan.selected_alias, "shopping@example.com")
+        self.assertEqual([item.action for item in plan.actions], [
+            TransformAction.KEEP,
+            TransformAction.REWRITE,
+            TransformAction.DROP,
+        ])
+        self.assertEqual(plan.actions[1].replacement, "reply+newperson@simplelogin.co")
+
+    def test_one_recipient_resolver_failure_rejects_whole_plan(self):
+        # Fail-closed invariant: if ANY external recipient's reverse-alias
+        # lookup/creation fails, the entire plan must be rejected, even
+        # though other recipients (including a genuinely new external one)
+        # resolved successfully. Recipient rewriting is all-or-nothing.
+        context = RoutingContext(
+            own_simplelogin_aliases={"shopping@example.com"},
+            known_reverse_aliases={"reply+existing@simplelogin.co"},
+        )
+
+        def flaky_resolver(original, alias):
+            if original == "unlucky@example.com":
+                raise RuntimeError("simplelogin api unavailable")
+            return resolver(original, alias)
+
+        plan = build_transform_plan(
+            [
+                "reply+existing@simplelogin.co",
+                "lucky@example.com",
+                "unlucky@example.com",
+                "shopping@example.com",
+            ],
+            context,
+            reverse_alias_resolver=flaky_resolver,
+        )
+
+        self.assertTrue(plan.rejected)
+        self.assertIn("reverse alias lookup failed", plan.rejection_reason)
+
     def test_all_reverse_alias_recipients_do_not_need_selected_alias(self):
         context = RoutingContext(
             known_reverse_aliases={"reply+alice@simplelogin.co", "reply+bob@simplelogin.co"},
