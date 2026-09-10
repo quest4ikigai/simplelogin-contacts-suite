@@ -940,6 +940,137 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             upstream.stop(no_assert=True)
 
 
+    async def test_reverse_alias_plus_new_recipient_reply_end_to_end(self):
+        # Regression for the reported incident: a reply where an existing
+        # reverse alias was manually moved into To alongside a newly added
+        # ordinary recipient, with the sender's own alias left in Cc. The
+        # ordinary recipient must be converted to a reverse alias end to
+        # end, not forwarded to Proton Bridge literally.
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+                known_reverse_aliases={"reply+existing@simplelogin.co"},
+                manual_simplelogin_aliases={"shopping@example.com"},
+            ),
+            reverse_alias_resolver=lambda recipient, alias: f"reply+{recipient.split('@', 1)[0]}@simplelogin.co",
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "reply+existing@simplelogin.co, newperson@example.com"
+            msg["Cc"] = "shopping@example.com"
+            msg.set_content("private body")
+
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                submit_message,
+                proxy.port,
+                msg,
+                [
+                    "reply+existing@simplelogin.co",
+                    "newperson@example.com",
+                    "shopping@example.com",
+                ],
+            )
+
+            self.assertEqual(result[0], 250)
+            self.assertEqual(len(upstream_handler.messages), 1)
+            captured = upstream_handler.messages[0]
+            self.assertEqual(
+                captured["rcpt_tos"],
+                ["reply+existing@simplelogin.co", "reply+newperson@simplelogin.co"],
+            )
+            forwarded = BytesParser(policy=policy.default).parsebytes(captured["content"])
+            self.assertEqual(
+                forwarded.get("To"),
+                "reply+existing@simplelogin.co, reply+newperson@simplelogin.co",
+            )
+            self.assertIsNone(forwarded.get("Cc"))
+            content = captured["content"].decode("utf-8", errors="replace")
+            self.assertNotIn("newperson@example.com", content)
+            self.assertNotIn("shopping@example.com", content)
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
+    async def test_one_recipient_resolver_failure_rejects_entire_message(self):
+        # Fail-closed / all-or-nothing invariant: if any recipient's
+        # reverse-alias lookup fails, nothing should be forwarded upstream,
+        # even though another recipient in the same message resolved fine
+        # and an existing reverse alias just needed to be kept.
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+
+        def flaky_resolver(recipient, alias):
+            if recipient == "unlucky@example.com":
+                raise RuntimeError("simplelogin api unavailable")
+            return f"reply+{recipient.split('@', 1)[0]}@simplelogin.co"
+
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+                known_reverse_aliases={"reply+existing@simplelogin.co"},
+                manual_simplelogin_aliases={"shopping@example.com"},
+            ),
+            reverse_alias_resolver=flaky_resolver,
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "reply+existing@simplelogin.co, lucky@example.com, unlucky@example.com"
+            msg["Cc"] = "shopping@example.com"
+            msg.set_content("private body")
+
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                submit_message,
+                proxy.port,
+                msg,
+                [
+                    "reply+existing@simplelogin.co",
+                    "lucky@example.com",
+                    "unlucky@example.com",
+                    "shopping@example.com",
+                ],
+            )
+
+            self.assertEqual(result[0], 550)
+            self.assertEqual(upstream_handler.messages, [])
+            self.assertTrue(proxy.last_plan.rejected)
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
     async def test_forwarding_preserves_to_cover_alias_and_rewrites_bcc_recipients(self):
         upstream_handler = CaptureUpstreamHandler()
         upstream_port = free_port()

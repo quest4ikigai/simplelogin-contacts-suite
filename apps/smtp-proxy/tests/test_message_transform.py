@@ -11,7 +11,12 @@ sys.path.insert(0, os.path.abspath(CORE_SRC))
 sys.path.insert(0, os.path.abspath(SIMPLELOGIN_SRC))
 
 from sl_smtp_proxy.config import SmtpProxyConfig
-from alias_routing_core import TransformAction
+from alias_routing_core import (
+    RecipientClassification,
+    TransformAction,
+    TransformPlan,
+    TransformPlanItem,
+)
 from sl_smtp_proxy.message_transform import (
     apply_transform,
     build_plan_for_message,
@@ -180,6 +185,86 @@ class MessageTransformTests(unittest.TestCase):
             TransformAction.KEEP,
             TransformAction.DROP,
         ])
+
+
+    def test_reverse_alias_and_new_recipient_in_same_to_header_are_both_handled(self):
+        # Regression for the reported incident: a reply where an existing
+        # reverse alias was moved into To alongside a newly added ordinary
+        # recipient, with the sender's own alias left in Cc. The ordinary
+        # recipient must be converted to a reverse alias, not forwarded
+        # literally.
+        msg = EmailMessage()
+        msg["From"] = "sender@example.com"
+        msg["To"] = "reply+existing@simplelogin.co, newperson@example.com"
+        msg["Cc"] = "shopping@example.com"
+        msg.set_content("private body")
+
+        cfg = SmtpProxyConfig(
+            require_auth=False,
+            known_reverse_aliases={"reply+existing@simplelogin.co"},
+        )
+        _, plan = build_plan_for_message(
+            "sender@example.com",
+            [
+                "reply+existing@simplelogin.co",
+                "newperson@example.com",
+                "shopping@example.com",
+            ],
+            msg.as_bytes(),
+            cfg,
+            reverse_alias_resolver=lambda original, alias: f"reply+{original.split('@', 1)[0]}@simplelogin.co",
+            extra_simplelogin_aliases={"shopping@example.com"},
+        )
+
+        transformed = apply_transform(msg, plan, cfg)
+
+        self.assertFalse(plan.rejected)
+        self.assertEqual(transformed.get("To"), "reply+existing@simplelogin.co, reply+newperson@simplelogin.co")
+        self.assertIsNone(transformed.get("Cc"))
+        self.assertNotIn("newperson@example.com", transformed.as_string())
+        self.assertEqual(transformed_envelope_recipients(plan), [
+            "reply+existing@simplelogin.co",
+            "reply+newperson@simplelogin.co",
+        ])
+
+    def test_rewrite_header_never_leaks_rejected_recipient_as_literal_text(self):
+        # Regression: rewrite_address_header/_replacement_for must never
+        # let a REJECTED recipient survive as literal text in a rewritten
+        # header. Previously the DROP/REWRITE/KEEP if-chain had no branch
+        # for REJECT, so it silently fell through and treated an
+        # unresolved recipient as "not matched", passing it through
+        # unchanged. This plan is deliberately not marked `rejected` to
+        # exercise rewrite_address_header/apply_transform in isolation
+        # (defense-in-depth, independent of the fail_closed gate).
+        msg = EmailMessage()
+        msg["From"] = "sender@example.com"
+        msg["To"] = "reply+existing@simplelogin.co, unresolved@example.com"
+        msg.set_content("private body")
+
+        cfg = SmtpProxyConfig(require_auth=False)
+        plan = TransformPlan(
+            selected_alias="shopping@example.com",
+            actions=[
+                TransformPlanItem(
+                    original="reply+existing@simplelogin.co",
+                    classification=RecipientClassification.KNOWN_REVERSE_ALIAS,
+                    action=TransformAction.KEEP,
+                ),
+                TransformPlanItem(
+                    original="unresolved@example.com",
+                    classification=RecipientClassification.EXTERNAL_RECIPIENT,
+                    action=TransformAction.REJECT,
+                    reason="reverse alias lookup failed: boom",
+                ),
+            ],
+            rejected=False,
+        )
+
+        transformed = apply_transform(msg, plan, cfg)
+
+        self.assertNotIn("unresolved@example.com", transformed.as_string())
+        self.assertEqual(transformed.get("To"), "reply+existing@simplelogin.co")
+        self.assertEqual(transformed_envelope_recipients(plan), ["reply+existing@simplelogin.co"])
 
 
 if __name__ == "__main__":
