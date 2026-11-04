@@ -76,3 +76,82 @@ Bcc: alice@example.org, bob@example.org
 The proxy preserves `To: announcements@example.net`, removes that alias from the
 SMTP envelope, strips `Bcc`, and forwards only the rewritten SimpleLogin reverse
 aliases for the Bcc recipients.
+
+## Bulk recipients and concurrency
+
+Recipient resolution (SimpleLogin alias refresh and reverse-alias lookup) runs
+on a bounded worker-thread pool, never on the asyncio event loop. A message
+with many uncached recipients can therefore take a while to resolve without
+making the proxy unresponsive to other connections or to health checks in the
+meantime.
+
+For a message with many previously-unseen recipients under the same alias,
+the proxy pre-fetches that alias's SimpleLogin contact list once and resolves
+every recipient against that single result (falling back automatically, per
+recipient, to the original slower path if the bulk pre-fetch fails for any
+reason). A 40-50 recipient classroom-style send therefore costs one contact
+list fetch plus one contact-creation call per genuinely new recipient, not one
+contact list fetch per recipient.
+
+Relevant settings:
+
+```dotenv
+SMTP_PROXY_RESOLVER_MAX_WORKERS=4
+SMTP_PROXY_FORWARD_MAX_WORKERS=4
+```
+
+`SMTP_PROXY_RESOLVER_MAX_WORKERS` bounds how many messages can have their
+recipient resolution in flight against the SimpleLogin API at once.
+`SMTP_PROXY_FORWARD_MAX_WORKERS` bounds concurrent upstream SMTP forwarding.
+Both default to 4 and exist to cap thread/connection growth under concurrent
+load rather than to tune for a specific throughput target.
+
+## Delivery-state handling and duplicate submissions
+
+Forwarding to upstream SMTP runs as its own task, shielded from cancellation.
+If the submitting client disconnects (or its connection times out) while a
+message is already being forwarded, the proxy does not abandon that send: the
+upstream SMTP conversation runs to completion and its real outcome (forwarded
+or failed) is still logged, with an `smtp_message_forwarded` or
+`smtp_message_rejected` audit event carrying the same `correlation_id` as the
+`smtp_client_disconnected_during_processing` event for that submission. The
+original client never receives a response in this case -- SMTP cannot change
+that -- but the operational logs are no longer silent about what actually
+happened upstream.
+
+This closes one, but not all, of the gaps that made a client-side retry risk
+sending the same message twice: by default
+(`SMTP_PROXY_DUPLICATE_SUPPRESSION_WINDOW_SECONDS=86400`), the proxy
+fingerprints every message it forwards (its `Message-Id`, or a content hash
+if that header is absent, plus its envelope sender and rewritten recipients)
+and keeps that fingerprint in the local SQLite cache. A resubmission that
+matches a fingerprint forwarded within the window is rejected with `550
+Duplicate submission suppressed` instead of being sent again. Set the window
+to `0` to disable this check entirely.
+
+This is a best-effort safeguard, not a delivery guarantee: a mail client that
+assigns a new `Message-Id` on every retry (rather than resending the exact
+same compose) will not be caught by it, and the proxy cannot make SMTP itself
+exactly-once. Treat the dedup window as reducing the odds of an accidental
+duplicate send after an ambiguous client disconnect, not eliminating them.
+
+## Diagnostics and logging
+
+Each SMTP submission gets a short `correlation_id` that appears on every
+audit event logged for it (`smtp_transform_plan`, `smtp_message_forwarded`,
+`smtp_message_rejected`, `smtp_client_disconnected_during_processing`, etc.),
+so one submission's full lifecycle can be followed across both the event
+loop and worker-thread log lines. The `smtp_transform_plan` event also
+reports timing (`alias_refresh_ms`, `resolution_ms`,
+`transform_validate_ms`) and SimpleLogin API/cache efficiency
+(`simplelogin_request_count`, `simplelogin_request_duration_ms`,
+`cache_hit_count`, `cache_miss_count`, `contacts_found`, `contacts_created`)
+for that submission.
+
+`aiosmtpd` itself logs raw, unredacted SMTP protocol lines (including literal
+`MAIL FROM`/`RCPT TO` addresses) under the `mail.log` logger name. The proxy
+defaults that logger to `WARNING` regardless of `LOG_LEVEL`, so normal
+operation never leaks addresses through it. Set
+`SMTP_PROXY_AIOSMTPD_LOG_LEVEL=INFO` (or `DEBUG`) only for temporary protocol
+troubleshooting, with the explicit understanding that doing so exposes real
+recipient addresses in the logs.

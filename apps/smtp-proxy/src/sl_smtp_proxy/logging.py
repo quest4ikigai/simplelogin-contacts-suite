@@ -90,8 +90,17 @@ def audit_event(event: str, **fields: Any) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
-def configure_logging(level: str) -> None:
+def configure_logging(level: str, aiosmtpd_log_level: str = "WARNING") -> None:
     stdlib_logging.basicConfig(
         level=getattr(stdlib_logging, level.upper(), stdlib_logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    # aiosmtpd logs raw protocol lines (including literal MAIL FROM/RCPT TO
+    # addresses) under the "mail.log" logger at INFO, bypassing this
+    # application's own address redaction. Default that logger to WARNING
+    # so normal operation never leaks addresses through it; operators who
+    # need protocol-level tracing can opt back into INFO/DEBUG explicitly
+    # via SMTP_PROXY_AIOSMTPD_LOG_LEVEL, accepting that tradeoff.
+    stdlib_logging.getLogger("mail.log").setLevel(
+        getattr(stdlib_logging, aiosmtpd_log_level.upper(), stdlib_logging.WARNING)
     )

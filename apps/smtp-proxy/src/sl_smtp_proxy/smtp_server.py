@@ -1,19 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+import functools
+import hashlib
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from email import policy
+from email.message import Message
 import hmac
 import logging
 import socket
 import ssl
 import time
 import warnings
-from typing import Optional
+from typing import Dict, Optional, Sequence
 
 from aiosmtpd.controller import Controller
 from aiosmtpd.smtp import AuthResult, LoginPassword, SMTP
 from alias_routing_core import normalize_email_address
+from simplelogin_client import RequestStats
 
+from .cache import SQLiteAliasCache
 from .config import SmtpProxyConfig
 from .config_validation import validate_startup_config
 from .forwarder import UpstreamForwardingError, UpstreamSmtpForwarder
@@ -25,11 +33,49 @@ from .message_transform import (
     transformed_envelope_recipients,
 )
 from .mime_sender_validation import validate_mime_sender
-from .reverse_alias_resolver import resolver_from_config
+from .reverse_alias_resolver import ResolutionStats, ReverseAliasResolver, resolver_from_config
 from .safety_verifier import verify_post_transform_safety, visible_recipient_count
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _new_correlation_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def _forward_fingerprint(sender: str, recipients: Sequence[str], message: Message) -> str:
+    """Fingerprint a forwarded message for duplicate-submission suppression.
+
+    Prefers the message's own Message-Id (set once by the originating MUA
+    and normally preserved across a client-side retry of the same
+    compose) and falls back to a content hash when it is absent. This is
+    a best-effort defense, not a delivery guarantee: a client that
+    generates a new Message-Id per retry will not be caught by it.
+    """
+    message_id = (message.get("Message-Id") or "").strip()
+    if message_id:
+        content_key = message_id
+    else:
+        content_key = hashlib.sha256(message.as_bytes(policy=policy.SMTP)).hexdigest()
+    normalized_sender = normalize_email_address(sender) or (sender or "").casefold()
+    normalized_recipients = sorted(
+        normalize_email_address(recipient) or recipient.casefold() for recipient in recipients
+    )
+    raw = "|".join([normalized_sender, ",".join(normalized_recipients), content_key])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _swallow_task_exception(task: "asyncio.Task") -> None:
+    # Safety net for the shielded forwarding task: if the client
+    # disconnects, handle_DATA stops awaiting this task (though it keeps
+    # running independently), so nothing else is guaranteed to retrieve
+    # its result. Without this, asyncio logs "Task exception was never
+    # retrieved" once the task is garbage collected. The real audit
+    # logging for the outcome always happens inside the task itself.
+    if task.cancelled():
+        return
+    task.exception()
 TLS_MODES = {"starttls", "implicit"}
 AIOSMTPD_AUTH_TLS_WARNING = (
     "Requiring AUTH while not requiring TLS can lead to security vulnerabilities!"
@@ -83,6 +129,22 @@ class SmtpProxyHandler:
             else resolver_from_config(config)
         )
         self.forwarder = forwarder or UpstreamSmtpForwarder(config)
+        self._dedup_cache = SQLiteAliasCache(config.cache_path)
+        # Separate bounded pools for resolution (SimpleLogin API/cache work)
+        # and forwarding (upstream SMTP) so a burst of large messages can't
+        # spawn unbounded threads, and so one stage can't starve the other.
+        self._resolver_executor = ThreadPoolExecutor(
+            max_workers=max(1, config.resolver_max_workers),
+            thread_name_prefix="sl-resolver",
+        )
+        self._forward_executor = ThreadPoolExecutor(
+            max_workers=max(1, config.forward_max_workers),
+            thread_name_prefix="sl-forward",
+        )
+
+    def close(self) -> None:
+        self._resolver_executor.shutdown(wait=False)
+        self._forward_executor.shutdown(wait=False)
 
     async def handle_MAIL(self, server, session, envelope, address, mail_options) -> str:
         if not _sender_allowed(self.config, address):
@@ -101,154 +163,304 @@ class SmtpProxyHandler:
         return "250 OK"
 
     async def handle_DATA(self, server, session, envelope) -> str:
-        content = envelope.original_content
-        if content is None:
-            content = envelope.content
-        if isinstance(content, str):
-            data = content.encode("utf-8", errors="replace")
-        else:
-            data = bytes(content or b"")
+        correlation_id = _new_correlation_id()
+        peer = _peer_host(session)
+        loop = asyncio.get_running_loop()
+        started = time.monotonic()
+        phase = "parsing"
+        timings: Dict[str, int] = {}
+        request_stats = RequestStats()
+        resolution_stats = ResolutionStats()
+        try:
+            content = envelope.original_content
+            if content is None:
+                content = envelope.content
+            if isinstance(content, str):
+                data = content.encode("utf-8", errors="replace")
+            else:
+                data = bytes(content or b"")
 
-        parsed_message = parse_message(data)
-        mime_sender_validation = validate_mime_sender(parsed_message, self.config)
-        if not mime_sender_validation.accepted:
+            parsed_message = parse_message(data)
+            mime_sender_validation = validate_mime_sender(parsed_message, self.config)
+            if not mime_sender_validation.accepted:
+                LOGGER.info(
+                    "audit %s",
+                    audit_event(
+                        "smtp_mime_sender_rejected",
+                        peer=peer,
+                        correlation_id=correlation_id,
+                        policy="mime_sender_validation",
+                        header=mime_sender_validation.header,
+                        reason=mime_sender_validation.reason,
+                        from_count=mime_sender_validation.from_count,
+                        sender_count=mime_sender_validation.sender_count,
+                    ),
+                )
+                return "550 MIME sender address is not allowed by SimpleLogin proxy policy"
+
+            phase = "alias_refresh"
+            alias_refresh_started = time.monotonic()
+            extra_simplelogin_aliases = set()
+            if self.config.strip_own_aliases and hasattr(self.reverse_alias_resolver, "owned_alias_emails"):
+                # Only our own ReverseAliasResolver's owned_alias_emails()
+                # understands request_stats; an injected/duck-typed
+                # resolver (as used in tests and custom deployments) keeps
+                # its original no-argument contract.
+                if isinstance(self.reverse_alias_resolver, ReverseAliasResolver):
+                    owned_alias_call = functools.partial(
+                        self.reverse_alias_resolver.owned_alias_emails,
+                        request_stats=request_stats,
+                    )
+                else:
+                    owned_alias_call = self.reverse_alias_resolver.owned_alias_emails
+                try:
+                    extra_simplelogin_aliases = await loop.run_in_executor(
+                        self._resolver_executor,
+                        owned_alias_call,
+                    )
+                except Exception as exc:
+                    public_message = getattr(exc, "public_message", type(exc).__name__)
+                    LOGGER.info(
+                        "audit %s",
+                        audit_event(
+                            "smtp_message_rejected",
+                            peer=peer,
+                            correlation_id=correlation_id,
+                            policy="alias_refresh_failed",
+                            reason=safe_reason(f"SimpleLogin alias refresh failed: {public_message}"),
+                        ),
+                    )
+                    return f"550 SimpleLogin alias refresh failed: {public_message}"
+            timings["alias_refresh_ms"] = int((time.monotonic() - alias_refresh_started) * 1000)
+
+            # Recipient resolution runs in a worker thread: it can make
+            # many blocking SimpleLogin HTTP requests for a bulk send, and
+            # must never block the event loop (and therefore health
+            # checks and other connections) while it does.
+            phase = "resolution"
+            resolution_started = time.monotonic()
+            message, plan = await loop.run_in_executor(
+                self._resolver_executor,
+                functools.partial(
+                    build_plan_for_message,
+                    envelope.mail_from or "",
+                    list(envelope.rcpt_tos),
+                    data,
+                    self.config,
+                    reverse_alias_resolver=self.reverse_alias_resolver,
+                    extra_simplelogin_aliases=extra_simplelogin_aliases,
+                    request_stats=request_stats,
+                    resolution_stats=resolution_stats,
+                ),
+            )
+            timings["resolution_ms"] = int((time.monotonic() - resolution_started) * 1000)
+            self.last_plan = plan
+            LOGGER.info("transform_plan %s", plan_summary(plan, self.config.log_redact_addresses))
             LOGGER.info(
                 "audit %s",
                 audit_event(
-                    "smtp_mime_sender_rejected",
-                    peer=_peer_host(session),
-                    policy="mime_sender_validation",
-                    header=mime_sender_validation.header,
-                    reason=mime_sender_validation.reason,
-                    from_count=mime_sender_validation.from_count,
-                    sender_count=mime_sender_validation.sender_count,
+                    "smtp_transform_plan",
+                    peer=peer,
+                    correlation_id=correlation_id,
+                    simplelogin_request_count=request_stats.request_count,
+                    simplelogin_request_duration_ms=int(request_stats.total_duration_seconds * 1000),
+                    cache_hit_count=resolution_stats.cache_hits,
+                    cache_miss_count=resolution_stats.cache_misses,
+                    contacts_found=resolution_stats.contacts_found,
+                    contacts_created=resolution_stats.contacts_created,
+                    **timings,
+                    **plan_audit_fields(plan, self.config.log_redact_addresses),
                 ),
             )
-            return "550 MIME sender address is not allowed by SimpleLogin proxy policy"
-
-        extra_simplelogin_aliases = set()
-        if self.config.strip_own_aliases and hasattr(self.reverse_alias_resolver, "owned_alias_emails"):
-            try:
-                extra_simplelogin_aliases = self.reverse_alias_resolver.owned_alias_emails()
-            except Exception as exc:
-                public_message = getattr(exc, "public_message", type(exc).__name__)
+            if plan.rejected:
                 LOGGER.info(
                     "audit %s",
                     audit_event(
                         "smtp_message_rejected",
-                        peer=_peer_host(session),
-                        policy="alias_refresh_failed",
-                        reason=safe_reason(f"SimpleLogin alias refresh failed: {public_message}"),
+                        peer=peer,
+                        correlation_id=correlation_id,
+                        policy="transform_plan_rejected",
+                        reason=safe_reason(plan.rejection_reason),
                     ),
                 )
-                return f"550 SimpleLogin alias refresh failed: {public_message}"
+                return f"550 {plan.rejection_reason or 'Message rejected by SimpleLogin proxy policy'}"
 
-        message, plan = build_plan_for_message(
-            envelope.mail_from or "",
-            list(envelope.rcpt_tos),
-            data,
-            self.config,
-            reverse_alias_resolver=self.reverse_alias_resolver,
-            extra_simplelogin_aliases=extra_simplelogin_aliases,
-        )
-        self.last_plan = plan
-        LOGGER.info("transform_plan %s", plan_summary(plan, self.config.log_redact_addresses))
-        LOGGER.info(
-            "audit %s",
-            audit_event(
-                "smtp_transform_plan",
-                peer=_peer_host(session),
-                **plan_audit_fields(plan, self.config.log_redact_addresses),
-            ),
-        )
-        if plan.rejected:
-            LOGGER.info(
-                "audit %s",
-                audit_event(
-                    "smtp_message_rejected",
-                    peer=_peer_host(session),
-                    policy="transform_plan_rejected",
-                    reason=safe_reason(plan.rejection_reason),
-                ),
-            )
-            return f"550 {plan.rejection_reason or 'Message rejected by SimpleLogin proxy policy'}"
-
-        transformed_message = apply_transform(message, plan, self.config)
-        transformed_recipients = transformed_envelope_recipients(plan)
-        verification = verify_post_transform_safety(
-            transformed_message,
-            transformed_recipients,
-            self.config,
-            plan,
-            extra_simplelogin_aliases=extra_simplelogin_aliases,
-        )
-        if not verification.accepted:
-            LOGGER.info(
-                "audit %s",
-                audit_event(
-                    "smtp_message_rejected",
-                    peer=_peer_host(session),
-                    policy="post_transform_safety_verifier",
-                    invariant=verification.invariant,
-                    location=verification.location,
-                    reason=verification.reason,
-                    recipient_count=len(transformed_recipients),
-                    visible_recipient_count=visible_recipient_count(transformed_message),
-                ),
-            )
-            return "550 Message rejected by SimpleLogin proxy post-transform safety verifier"
-        if not transformed_recipients:
-            LOGGER.info(
-                "audit %s",
-                audit_event(
-                    "smtp_message_rejected",
-                    peer=_peer_host(session),
-                    policy="no_deliverable_recipients",
-                    reason="No deliverable recipients after SimpleLogin routing",
-                ),
-            )
-            return "550 No deliverable recipients after SimpleLogin routing"
-        if self.config.dry_run:
-            LOGGER.info(
-                "audit %s",
-                audit_event(
-                    "smtp_message_rejected",
-                    peer=_peer_host(session),
-                    policy="dry_run",
-                    reason="SimpleLogin SMTP proxy dry-run: message not forwarded",
-                ),
-            )
-            return "550 SimpleLogin SMTP proxy dry-run: message not forwarded"
-
-        try:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None,
-                self.forwarder.forward,
-                envelope.mail_from or "",
-                transformed_recipients,
+            phase = "transform"
+            transform_started = time.monotonic()
+            transformed_message = apply_transform(message, plan, self.config)
+            transformed_recipients = transformed_envelope_recipients(plan)
+            verification = verify_post_transform_safety(
                 transformed_message,
+                transformed_recipients,
+                self.config,
+                plan,
+                extra_simplelogin_aliases=extra_simplelogin_aliases,
+            )
+            timings["transform_validate_ms"] = int((time.monotonic() - transform_started) * 1000)
+            if not verification.accepted:
+                LOGGER.info(
+                    "audit %s",
+                    audit_event(
+                        "smtp_message_rejected",
+                        peer=peer,
+                        correlation_id=correlation_id,
+                        policy="post_transform_safety_verifier",
+                        invariant=verification.invariant,
+                        location=verification.location,
+                        reason=verification.reason,
+                        recipient_count=len(transformed_recipients),
+                        visible_recipient_count=visible_recipient_count(transformed_message),
+                    ),
+                )
+                return "550 Message rejected by SimpleLogin proxy post-transform safety verifier"
+            if not transformed_recipients:
+                LOGGER.info(
+                    "audit %s",
+                    audit_event(
+                        "smtp_message_rejected",
+                        peer=peer,
+                        correlation_id=correlation_id,
+                        policy="no_deliverable_recipients",
+                        reason="No deliverable recipients after SimpleLogin routing",
+                    ),
+                )
+                return "550 No deliverable recipients after SimpleLogin routing"
+            if self.config.dry_run:
+                LOGGER.info(
+                    "audit %s",
+                    audit_event(
+                        "smtp_message_rejected",
+                        peer=peer,
+                        correlation_id=correlation_id,
+                        policy="dry_run",
+                        reason="SimpleLogin SMTP proxy dry-run: message not forwarded",
+                    ),
+                )
+                return "550 SimpleLogin SMTP proxy dry-run: message not forwarded"
+
+            phase = "duplicate_check"
+            fingerprint = None
+            if self.config.duplicate_suppression_window_seconds > 0:
+                fingerprint = _forward_fingerprint(
+                    envelope.mail_from or "", transformed_recipients, transformed_message
+                )
+                try:
+                    is_duplicate = self._dedup_cache.was_recently_forwarded(
+                        fingerprint, self.config.duplicate_suppression_window_seconds
+                    )
+                except Exception:
+                    # Duplicate suppression is a best-effort safety net, not
+                    # a delivery gate: a local cache/disk problem must not
+                    # block legitimate mail. Fail open here and still try
+                    # to forward normally.
+                    LOGGER.exception("Duplicate-submission cache lookup failed; forwarding anyway")
+                    is_duplicate = False
+                if is_duplicate:
+                    LOGGER.info(
+                        "audit %s",
+                        audit_event(
+                            "smtp_message_rejected",
+                            peer=peer,
+                            correlation_id=correlation_id,
+                            policy="duplicate_suppressed",
+                            reason="duplicate_suppressed",
+                            recipient_count=len(transformed_recipients),
+                        ),
+                    )
+                    return (
+                        "550 Duplicate submission suppressed: an identical message "
+                        "was already forwarded recently"
+                    )
+
+            # Forwarding runs as an independent, shielded task: if the
+            # client disconnects while this is in flight, handle_DATA's
+            # own await is cancelled (as it must be, so the connection
+            # teardown proceeds normally), but the forwarding task keeps
+            # running to completion and always logs its real outcome --
+            # an upstream send already accepted by Proton Bridge is never
+            # silently dropped on the floor just because nobody is left
+            # to read the SMTP response.
+            phase = "forwarding"
+            forward_started = time.monotonic()
+            forward_task = asyncio.ensure_future(
+                self._forward_and_record(
+                    correlation_id=correlation_id,
+                    peer=peer,
+                    sender=envelope.mail_from or "",
+                    recipients=transformed_recipients,
+                    message=transformed_message,
+                    fingerprint=fingerprint,
+                    started=forward_started,
+                )
+            )
+            forward_task.add_done_callback(_swallow_task_exception)
+            try:
+                await asyncio.shield(forward_task)
+            except UpstreamForwardingError as exc:
+                return f"550 {exc.public_message}"
+            return "250 Message accepted for delivery"
+        except asyncio.CancelledError:
+            LOGGER.info(
+                "audit %s",
+                audit_event(
+                    "smtp_client_disconnected_during_processing",
+                    peer=peer,
+                    correlation_id=correlation_id,
+                    phase=phase,
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                ),
+            )
+            raise
+
+    async def _forward_and_record(
+        self,
+        correlation_id: str,
+        peer: str,
+        sender: str,
+        recipients,
+        message: Message,
+        fingerprint: Optional[str],
+        started: float,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                self._forward_executor,
+                self.forwarder.forward,
+                sender,
+                recipients,
+                message,
             )
         except UpstreamForwardingError as exc:
             LOGGER.info(
                 "audit %s",
                 audit_event(
                     "smtp_message_rejected",
-                    peer=_peer_host(session),
+                    peer=peer,
+                    correlation_id=correlation_id,
                     policy="upstream_unavailable",
                     reason=safe_reason(exc.public_message),
+                    recipient_count=len(recipients),
+                    forward_duration_ms=int((time.monotonic() - started) * 1000),
                 ),
             )
-            return f"550 {exc.public_message}"
+            raise
+
+        if fingerprint:
+            try:
+                self._dedup_cache.record_forwarded(fingerprint)
+            except Exception:
+                LOGGER.exception("Failed to record forwarded-message dedup fingerprint")
         LOGGER.info(
             "audit %s",
             audit_event(
                 "smtp_message_forwarded",
-                peer=_peer_host(session),
-                recipient_count=len(transformed_recipients),
+                peer=peer,
+                correlation_id=correlation_id,
+                recipient_count=len(recipients),
+                forward_duration_ms=int((time.monotonic() - started) * 1000),
             ),
         )
-        return "250 Message accepted for delivery"
 
     def handle_exception(self, error: Exception) -> str:
         LOGGER.exception("SMTP proxy handler failed: %s", type(error).__name__)
@@ -320,6 +532,7 @@ class SmtpProxyServer:
             await asyncio.sleep(3600)
 
     async def stop(self) -> None:
+        self.handler.close()
         if not self._controller:
             return
         self._controller.stop(no_assert=True)

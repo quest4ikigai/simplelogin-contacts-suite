@@ -4,6 +4,7 @@ import json
 import logging
 from email import policy
 from email.parser import BytesParser
+from email.utils import parseaddr
 import os
 import shutil
 import socket
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import warnings
 from email.message import EmailMessage
@@ -27,6 +29,7 @@ sys.path.insert(0, os.path.abspath(APP_SRC))
 sys.path.insert(0, os.path.abspath(CORE_SRC))
 sys.path.insert(0, os.path.abspath(SIMPLELOGIN_SRC))
 
+from sl_smtp_proxy.cache import SQLiteAliasCache
 from sl_smtp_proxy.config import SmtpProxyConfig, load_config_from_env
 from sl_smtp_proxy.config_validation import StartupConfigError
 from sl_smtp_proxy.forwarder import UpstreamSmtpForwarder
@@ -124,6 +127,31 @@ def submit_message(port, msg, rcpt_tos, mail_from="sender@example.com"):
         return read_smtp_response(fileobj)
 
 
+def submit_message_and_disconnect(port, msg, rcpt_tos, mail_from="sender@example.com"):
+    """Like submit_message, but closes the connection the instant the DATA
+    terminator is written, without reading the final SMTP response --
+    simulating a client that times out or is killed before it sees
+    whether the proxy accepted the message.
+    """
+    sock = socket.create_connection(("127.0.0.1", port), timeout=2)
+    try:
+        fileobj = sock.makefile("rwb", buffering=0)
+        read_smtp_response(fileobj)
+        send_smtp_line(fileobj, "EHLO test.local")
+        read_smtp_response(fileobj)
+        send_smtp_line(fileobj, f"MAIL FROM:<{mail_from}>")
+        read_smtp_response(fileobj)
+        for rcpt_to in rcpt_tos:
+            send_smtp_line(fileobj, f"RCPT TO:<{rcpt_to}>")
+            read_smtp_response(fileobj)
+        send_smtp_line(fileobj, "DATA")
+        read_smtp_response(fileobj)
+        fileobj.write(msg.as_bytes().replace(b"\n", b"\r\n") + b"\r\n.\r\n")
+        fileobj.flush()
+    finally:
+        sock.close()
+
+
 def mail_from_response(port, mail_from="sender@example.com"):
     with socket.create_connection(("127.0.0.1", port), timeout=2) as sock:
         fileobj = sock.makefile("rwb", buffering=0)
@@ -217,11 +245,156 @@ class FakeResolverWithOwnedAliases:
         return "reply+alice@simplelogin.co"
 
 
+class FakeBulkSimpleLoginHttpServer:
+    """Like FakeSimpleLoginHttpServer, but tracks list_contacts page
+    requests separately and mints a distinct reverse alias per created
+    contact, so bulk-recipient efficiency and correctness can both be
+    asserted against the real SimpleLoginClient/ReverseAliasResolver.
+    """
+
+    def __init__(self, test_case, existing_contacts=None, fail_contacts_with_status=None):
+        self.requests = []
+        self.list_contacts_requests = 0
+        self.create_contact_requests = 0
+        self.aliases = [{"id": 123, "email": "shopping@example.com"}]
+        self.contacts = existing_contacts or []
+        self.fail_contacts_with_status = fail_contacts_with_status
+        fake = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                fake.requests.append((self.command, self.path, self.headers.get("Authentication"), None))
+                if self.path == "/api/v2/aliases?page_id=0":
+                    self._json(200, {"aliases": fake.aliases})
+                    return
+                if self.path == "/api/aliases/123/contacts?page_id=0":
+                    fake.list_contacts_requests += 1
+                    if fake.fail_contacts_with_status:
+                        self._json(fake.fail_contacts_with_status, {"error": "rate limited"})
+                        return
+                    self._json(200, {"contacts": fake.contacts})
+                    return
+                self._json(404, {"error": "not found"})
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8")
+                fake.requests.append((self.command, self.path, self.headers.get("Authentication"), body))
+                if self.path == "/api/aliases/123/contacts":
+                    fake.create_contact_requests += 1
+                    contact = json.loads(body)["contact"]
+                    _, address = parseaddr(contact)
+                    local = (address or contact).split("@", 1)[0]
+                    self._json(
+                        201,
+                        {
+                            "contact": {
+                                "id": f"created-{local}",
+                                "contact": contact,
+                                "reverse_alias_address": f"reply+{local}@simplelogin.co",
+                            }
+                        },
+                    )
+                    return
+                self._json(404, {"error": "not found"})
+
+            def log_message(self, format, *args):
+                return
+
+            def _json(self, status, payload):
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        test_case.addCleanup(self.close)
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def close(self):
+        self.httpd.shutdown()
+        self.thread.join(timeout=2)
+        self.httpd.server_close()
+
+
+class BlockingResolver:
+    """Deterministically "hangs" like a stuck SimpleLogin API call: it
+    signals `started` the instant it is entered (so a test can wait for
+    it with an Event instead of a sleep) and then blocks until the test
+    sets `release`.
+    """
+
+    def __init__(self, reverse_alias=lambda recipient: f"reply+{recipient.split('@', 1)[0]}@simplelogin.co"):
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self._reverse_alias = reverse_alias
+
+    def __call__(self, recipient, alias):
+        self.started.set()
+        self.release.wait(timeout=10)
+        return self._reverse_alias(recipient)
+
+
+class BlockingForwarder:
+    """Wraps a real forwarder but blocks inside forward() until released,
+    deterministically simulating a slow-but-eventually-successful upstream
+    send so a test can control exactly when a client disconnect happens
+    relative to the in-flight forward.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.completed = threading.Event()
+
+    def forward(self, sender, recipients, message):
+        self.started.set()
+        self.release.wait(timeout=10)
+        try:
+            return self.inner.forward(sender, recipients, message)
+        finally:
+            self.completed.set()
+
+
+def _wait_until(predicate, timeout=2.0, interval=0.02):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+async def _wait_until_async(predicate, timeout=2.0, interval=0.02):
+    # Polls on the event loop itself (never a worker thread), so it is
+    # safe to use against state --- like assertLogs' captured.output ---
+    # that the code under test only ever mutates from the event loop.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(interval)
+    return predicate()
+
+
 def local_smtp_config(**overrides):
     values = {"host": "127.0.0.1", "port": 0}
     values.update(overrides)
     if values.get("dry_run", True):
         values.setdefault("allow_unsafe_local_dry_run", True)
+    values.setdefault(
+        "cache_path",
+        os.path.join(tempfile.mkdtemp(prefix="sl-smtp-proxy-test-"), "cache.sqlite3"),
+    )
     return SmtpProxyConfig(**values)
 
 
@@ -1578,6 +1751,497 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             mail_log.removeHandler(handler)
             mail_log.setLevel(old_level)
             await auth_server.stop()
+
+    async def test_bulk_recipients_resolve_with_single_contact_list_fetch(self):
+        # Regression for the reported classroom-announcement hang: a
+        # 40-50 recipient message must not download the alias's full
+        # contact list once per recipient.
+        fake_simplelogin = FakeBulkSimpleLoginHttpServer(self)
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                simplelogin_base_url=fake_simplelogin.url,
+                simplelogin_api_key="test-api-key",
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+                cache_path=os.path.join(tempdir.name, "cache.sqlite3"),
+            ),
+        )
+        await proxy.start()
+        try:
+            recipients = [f"person{i}@example.org" for i in range(45)]
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = ", ".join(recipients)
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                submit_message,
+                proxy.port,
+                msg,
+                recipients,
+            )
+
+            self.assertEqual(result[0], 250)
+            self.assertEqual(fake_simplelogin.list_contacts_requests, 1)
+            self.assertEqual(fake_simplelogin.create_contact_requests, 45)
+            self.assertEqual(len(upstream_handler.messages), 1)
+            captured_rcpt_tos = upstream_handler.messages[0]["rcpt_tos"]
+            self.assertEqual(len(captured_rcpt_tos), 45)
+            self.assertEqual(len(set(captured_rcpt_tos)), 45)
+            self.assertTrue(all(addr.endswith("@simplelogin.co") for addr in captured_rcpt_tos))
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
+    async def test_bulk_recipients_with_cache_hits_skip_api_entirely(self):
+        fake_simplelogin = FakeBulkSimpleLoginHttpServer(self)
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        cache_path = os.path.join(tempdir.name, "cache.sqlite3")
+        cache = SQLiteAliasCache(cache_path)
+        cache.upsert_alias("123", "shopping@example.com")
+        cached_recipients = [f"cached{i}@example.org" for i in range(20)]
+        for i, recipient in enumerate(cached_recipients):
+            cache.upsert_contact(str(i), "123", recipient, recipient, f"reply+cached{i}@simplelogin.co")
+        new_recipients = [f"new{i}@example.org" for i in range(25)]
+
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                simplelogin_base_url=fake_simplelogin.url,
+                simplelogin_api_key="test-api-key",
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+                cache_path=cache_path,
+            ),
+        )
+        await proxy.start()
+        try:
+            recipients = cached_recipients + new_recipients
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = ", ".join(recipients)
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            with self.assertLogs("sl_smtp_proxy.smtp_server", level="INFO") as captured:
+                result = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    submit_message,
+                    proxy.port,
+                    msg,
+                    recipients,
+                )
+
+            self.assertEqual(result[0], 250)
+            self.assertEqual(fake_simplelogin.list_contacts_requests, 1)
+            self.assertEqual(fake_simplelogin.create_contact_requests, 25)
+            audit_payloads = [
+                json.loads(line.split("audit ", 1)[1])
+                for line in captured.output
+                if "audit " in line
+            ]
+            transform_payload = next(
+                payload for payload in audit_payloads if payload["event"] == "smtp_transform_plan"
+            )
+            self.assertEqual(transform_payload["cache_hit_count"], 20)
+            self.assertEqual(transform_payload["cache_miss_count"], 25)
+            self.assertEqual(transform_payload["contacts_created"], 25)
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
+    async def test_simplelogin_rate_limit_during_bulk_resolve_fails_closed(self):
+        fake_simplelogin = FakeBulkSimpleLoginHttpServer(self, fail_contacts_with_status=429)
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                simplelogin_base_url=fake_simplelogin.url,
+                simplelogin_api_key="test-api-key",
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+                cache_path=os.path.join(tempdir.name, "cache.sqlite3"),
+            ),
+        )
+        await proxy.start()
+        try:
+            recipients = [f"person{i}@example.org" for i in range(5)]
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = ", ".join(recipients)
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                submit_message,
+                proxy.port,
+                msg,
+                recipients,
+            )
+
+            self.assertEqual(result[0], 550)
+            self.assertEqual(upstream_handler.messages, [])
+            self.assertTrue(proxy.last_plan.rejected)
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
+    async def test_server_remains_responsive_while_recipient_resolution_is_blocked(self):
+        blocking_resolver = BlockingResolver()
+        proxy = SmtpProxyServer(
+            local_smtp_config(host="127.0.0.1", port=0, require_auth=False),
+            reverse_alias_resolver=blocking_resolver,
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            loop = asyncio.get_running_loop()
+            slow_send = loop.run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+
+            # Deterministically wait until the blocked resolver call has
+            # actually started inside the resolver's worker thread, rather
+            # than guessing at a sleep duration.
+            started = await loop.run_in_executor(None, blocking_resolver.started.wait, 2.0)
+            self.assertTrue(started, "resolver never started; cannot exercise the blocking scenario")
+
+            # While that first submission is stuck in recipient
+            # resolution, a brand-new connection/health probe must still
+            # be served promptly -- proving the event loop itself was
+            # never blocked.
+            probe_config = SmtpProxyConfig(host="127.0.0.1", port=proxy.port, require_auth=False)
+            await asyncio.wait_for(
+                loop.run_in_executor(None, check_health, probe_config, 2.0),
+                timeout=3.0,
+            )
+            probe_result = await asyncio.wait_for(
+                loop.run_in_executor(None, mail_from_response, proxy.port, "sender@example.com"),
+                timeout=3.0,
+            )
+            self.assertEqual(probe_result[0], 250)
+
+            blocking_resolver.release.set()
+            result = await asyncio.wait_for(slow_send, timeout=5.0)
+            self.assertEqual(result[0], 550)
+            self.assertIn("dry-run", result[1])
+        finally:
+            blocking_resolver.release.set()
+            await proxy.stop()
+
+    async def test_client_disconnect_during_resolution_does_not_forward(self):
+        blocking_resolver = BlockingResolver()
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+            ),
+            reverse_alias_resolver=blocking_resolver,
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            loop = asyncio.get_running_loop()
+            with self.assertLogs("sl_smtp_proxy.smtp_server", level="INFO") as captured:
+                disconnecting_send = loop.run_in_executor(
+                    None,
+                    submit_message_and_disconnect,
+                    proxy.port,
+                    msg,
+                    ["alice@example.com"],
+                )
+                started = await loop.run_in_executor(None, blocking_resolver.started.wait, 2.0)
+                self.assertTrue(started)
+                await asyncio.wait_for(disconnecting_send, timeout=3.0)
+                blocking_resolver.release.set()
+
+                def _disconnect_logged():
+                    return any(
+                        "smtp_client_disconnected_during_processing" in line
+                        for line in captured.output
+                    )
+
+                self.assertTrue(
+                    await _wait_until_async(_disconnect_logged, timeout=2.0),
+                    "expected a disconnect-during-processing audit event",
+                )
+
+            audit_payloads = [
+                json.loads(line.split("audit ", 1)[1])
+                for line in captured.output
+                if "audit " in line
+            ]
+            disconnect_events = [
+                payload
+                for payload in audit_payloads
+                if payload["event"] == "smtp_client_disconnected_during_processing"
+            ]
+            self.assertEqual(disconnect_events[0]["phase"], "resolution")
+            self.assertEqual(upstream_handler.messages, [])
+        finally:
+            blocking_resolver.release.set()
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
+    async def test_client_disconnect_during_forwarding_still_records_outcome(self):
+        # Regression for the reported incident: the upstream SMTP send
+        # completed successfully even though the client had already
+        # timed out and disconnected, and no forwarding audit event was
+        # ever logged. The forwarding task must run to completion and
+        # log its real outcome regardless of the client's fate.
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        real_forwarder = UpstreamSmtpForwarder(
+            SmtpProxyConfig(upstream_host="127.0.0.1", upstream_port=upstream_port)
+        )
+        blocking_forwarder = BlockingForwarder(real_forwarder)
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+            ),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+            forwarder=blocking_forwarder,
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            loop = asyncio.get_running_loop()
+            with self.assertLogs("sl_smtp_proxy.smtp_server", level="INFO") as captured:
+                disconnecting_send = loop.run_in_executor(
+                    None,
+                    submit_message_and_disconnect,
+                    proxy.port,
+                    msg,
+                    ["alice@example.com"],
+                )
+
+                started = await loop.run_in_executor(None, blocking_forwarder.started.wait, 2.0)
+                self.assertTrue(started, "forward() never started")
+                await asyncio.wait_for(disconnecting_send, timeout=3.0)
+
+                # The client is gone, but the in-flight forward must not
+                # be abandoned: release it and require it to still
+                # complete and still hand the message to upstream.
+                blocking_forwarder.release.set()
+                completed = await loop.run_in_executor(None, blocking_forwarder.completed.wait, 3.0)
+                self.assertTrue(completed, "forward() never completed after being released")
+
+                def _forwarded_logged():
+                    return any(
+                        '"event":"smtp_message_forwarded"' in line for line in captured.output
+                    )
+
+                self.assertTrue(
+                    await _wait_until_async(_forwarded_logged, timeout=2.0),
+                    "expected a definitive smtp_message_forwarded audit event after disconnect",
+                )
+
+            self.assertEqual(len(upstream_handler.messages), 1)
+            audit_payloads = [
+                json.loads(line.split("audit ", 1)[1])
+                for line in captured.output
+                if "audit " in line
+            ]
+            disconnect_events = [
+                payload
+                for payload in audit_payloads
+                if payload["event"] == "smtp_client_disconnected_during_processing"
+            ]
+            forwarded_events = [
+                payload for payload in audit_payloads if payload["event"] == "smtp_message_forwarded"
+            ]
+            self.assertEqual(disconnect_events[0]["phase"], "forwarding")
+            self.assertEqual(len(forwarded_events), 1)
+            self.assertEqual(
+                disconnect_events[0]["correlation_id"],
+                forwarded_events[0]["correlation_id"],
+            )
+        finally:
+            blocking_forwarder.release.set()
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
+    async def test_duplicate_submission_is_suppressed_without_resending(self):
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+            ),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["Message-Id"] = "<fixed-id@example.com>"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            first = await asyncio.get_running_loop().run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+            second = await asyncio.get_running_loop().run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+
+            self.assertEqual(first[0], 250)
+            self.assertEqual(second[0], 550)
+            self.assertIn("Duplicate submission suppressed", second[1])
+            self.assertEqual(len(upstream_handler.messages), 1)
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
+    async def test_resubmission_with_different_message_id_is_not_suppressed(self):
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+            ),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+        )
+        await proxy.start()
+        try:
+            def message(message_id):
+                msg = EmailMessage()
+                msg["From"] = "sender@example.com"
+                msg["To"] = "alice@example.com"
+                msg["Message-Id"] = message_id
+                msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+                msg.set_content("classroom announcement")
+                return msg
+
+            first = await asyncio.get_running_loop().run_in_executor(
+                None, submit_message, proxy.port, message("<one@example.com>"), ["alice@example.com"]
+            )
+            second = await asyncio.get_running_loop().run_in_executor(
+                None, submit_message, proxy.port, message("<two@example.com>"), ["alice@example.com"]
+            )
+
+            self.assertEqual(first[0], 250)
+            self.assertEqual(second[0], 250)
+            self.assertEqual(len(upstream_handler.messages), 2)
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
 
     async def test_require_tls_refuses_start_until_tls_is_configured(self):
         tls_server = SmtpProxyServer(
