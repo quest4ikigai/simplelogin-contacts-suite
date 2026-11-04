@@ -75,37 +75,89 @@ class ForwardedMessageDedupTests(unittest.TestCase):
         self.addCleanup(self.tmpdir.cleanup)
         self.cache = SQLiteAliasCache(os.path.join(self.tmpdir.name, "cache.sqlite3"))
 
-    def test_fingerprint_not_forwarded_until_recorded(self):
-        self.assertFalse(self.cache.was_recently_forwarded("fp-1", ttl_seconds=3600))
+    def test_fingerprint_claimable_until_reserved(self):
+        self.assertTrue(self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600))
 
-        self.cache.record_forwarded("fp-1")
+        self.assertFalse(self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600))
 
-        self.assertTrue(self.cache.was_recently_forwarded("fp-1", ttl_seconds=3600))
+    def test_concurrent_reservation_of_same_fingerprint_is_rejected(self):
+        # Simulates a client disconnecting mid-send and immediately
+        # retrying before the first attempt has recorded success: only one
+        # of the two reservation attempts may succeed.
+        first = self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600)
+        second = self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600)
 
-    def test_was_recently_forwarded_respects_ttl(self):
-        self.cache.record_forwarded("fp-1")
+        self.assertTrue(first)
+        self.assertFalse(second)
+
+    def test_mark_forwarded_keeps_fingerprint_reserved(self):
+        self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600)
+        self.cache.mark_forwarded("fp-1", prune_older_than_seconds=3600)
+
+        self.assertFalse(self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600))
+
+    def test_release_reservation_allows_retry_after_failure(self):
+        self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600)
+        self.cache.release_reservation("fp-1")
+
+        self.assertTrue(self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600))
+
+    def test_release_reservation_does_not_clear_a_completed_send(self):
+        self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600)
+        self.cache.mark_forwarded("fp-1", prune_older_than_seconds=3600)
+        self.cache.release_reservation("fp-1")
+
+        self.assertFalse(self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600))
+
+    def test_stale_reservation_respects_ttl(self):
+        self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600)
         with self.cache.connect() as conn:
             stale = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
             conn.execute("UPDATE forwarded_messages SET forwarded_at = ? WHERE fingerprint = ?", (stale, "fp-1"))
 
-        self.assertFalse(self.cache.was_recently_forwarded("fp-1", ttl_seconds=60))
+        self.assertTrue(self.cache.try_reserve_forwarding("fp-1", ttl_seconds=60))
 
     def test_zero_or_negative_ttl_disables_dedup(self):
-        self.cache.record_forwarded("fp-1")
+        self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600)
+        self.cache.mark_forwarded("fp-1", prune_older_than_seconds=3600)
 
-        self.assertFalse(self.cache.was_recently_forwarded("fp-1", ttl_seconds=0))
+        self.assertTrue(self.cache.try_reserve_forwarding("fp-1", ttl_seconds=0))
 
-    def test_record_forwarded_prunes_old_entries(self):
-        self.cache.record_forwarded("fp-old")
+    def test_mark_forwarded_prunes_old_entries(self):
+        self.cache.try_reserve_forwarding("fp-old", ttl_seconds=3600)
+        self.cache.mark_forwarded("fp-old", prune_older_than_seconds=3600)
         with self.cache.connect() as conn:
             ancient = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
             conn.execute("UPDATE forwarded_messages SET forwarded_at = ? WHERE fingerprint = ?", (ancient, "fp-old"))
 
-        self.cache.record_forwarded("fp-new", prune_older_than_seconds=30 * 24 * 3600)
+        self.cache.try_reserve_forwarding("fp-new", ttl_seconds=3600)
+        self.cache.mark_forwarded("fp-new", prune_older_than_seconds=30 * 24 * 3600)
 
         with self.cache.connect() as conn:
             rows = conn.execute("SELECT fingerprint FROM forwarded_messages").fetchall()
         self.assertEqual([row[0] for row in rows], ["fp-new"])
+
+    def test_mark_forwarded_prunes_using_configured_window_not_a_fixed_default(self):
+        # A window configured above 30 days must not have its entries
+        # pruned by a hardcoded 30-day default -- pruning must honor the
+        # actual configured suppression window so entries remain eligible
+        # for suppression for as long as the operator configured.
+        window_seconds = 45 * 24 * 3600
+        self.cache.try_reserve_forwarding("fp-old", ttl_seconds=window_seconds)
+        self.cache.mark_forwarded("fp-old", prune_older_than_seconds=window_seconds)
+        with self.cache.connect() as conn:
+            forty_days_ago = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+            conn.execute(
+                "UPDATE forwarded_messages SET forwarded_at = ? WHERE fingerprint = ?",
+                (forty_days_ago, "fp-old"),
+            )
+
+        self.cache.try_reserve_forwarding("fp-new", ttl_seconds=window_seconds)
+        self.cache.mark_forwarded("fp-new", prune_older_than_seconds=window_seconds)
+
+        with self.cache.connect() as conn:
+            rows = {row[0] for row in conn.execute("SELECT fingerprint FROM forwarded_messages").fetchall()}
+        self.assertIn("fp-old", rows)
 
 
 if __name__ == "__main__":

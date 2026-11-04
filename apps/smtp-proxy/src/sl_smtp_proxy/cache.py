@@ -30,7 +30,8 @@ ON contacts(alias_id, contact_email);
 
 CREATE TABLE IF NOT EXISTS forwarded_messages (
   fingerprint TEXT PRIMARY KEY,
-  forwarded_at TEXT NOT NULL
+  forwarded_at TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'completed'
 );
 
 CREATE INDEX IF NOT EXISTS idx_forwarded_messages_forwarded_at
@@ -283,15 +284,66 @@ class SQLiteAliasCache:
             return None
         return reverse_alias_address
 
-    def record_forwarded(
+    def try_reserve_forwarding(self, fingerprint: str, ttl_seconds: int) -> bool:
+        """Atomically claim a fingerprint for forwarding.
+
+        Returns True if the caller may proceed to forward: either no entry
+        exists for this fingerprint, or the existing entry (pending or
+        completed) is older than ttl_seconds and therefore no longer
+        eligible for suppression. In both cases a 'pending' reservation is
+        written in the same statement so a second, concurrent caller with
+        the same fingerprint (e.g. a client retry racing the first send)
+        sees the reservation and gets False instead of also forwarding.
+
+        Returns False if a reservation or completed send for this
+        fingerprint already exists within the window -- this submission is
+        a duplicate and must not be forwarded.
+
+        ttl_seconds <= 0 disables dedup entirely: always returns True
+        without touching the table.
+        """
+        if ttl_seconds <= 0:
+            return True
+        now_dt = datetime.now(timezone.utc)
+        cutoff = (now_dt - timedelta(seconds=ttl_seconds)).isoformat()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO forwarded_messages (fingerprint, forwarded_at, status)
+                VALUES (?, ?, 'pending')
+                ON CONFLICT(fingerprint) DO UPDATE SET
+                  forwarded_at = excluded.forwarded_at,
+                  status = 'pending'
+                WHERE forwarded_messages.forwarded_at < ?
+                """,
+                (fingerprint, now_dt.isoformat(), cutoff),
+            )
+            return cursor.rowcount == 1
+
+    def release_reservation(self, fingerprint: str) -> None:
+        """Release a pending reservation after a failed forward attempt.
+
+        Only removes the row if it is still 'pending' (not completed), so
+        this never clobbers a dedup record written by another submission
+        that reclaimed the same fingerprint after it expired.
+        """
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM forwarded_messages WHERE fingerprint = ? AND status = 'pending'",
+                (fingerprint,),
+            )
+
+    def mark_forwarded(
         self,
         fingerprint: str,
-        prune_older_than_seconds: int = 30 * 24 * 3600,
+        prune_older_than_seconds: int,
     ) -> None:
-        """Record that a message fingerprint was forwarded upstream.
+        """Mark a reserved fingerprint as successfully forwarded.
 
-        Opportunistically prunes stale entries so the table does not grow
-        without bound; this is the only place that writes to it.
+        Opportunistically prunes entries older than prune_older_than_seconds
+        so the table does not grow without bound; callers should pass the
+        configured suppression window here so pruning never removes an
+        entry that is still eligible for duplicate suppression.
         """
         now_dt = datetime.now(timezone.utc)
         cutoff = (now_dt - timedelta(seconds=prune_older_than_seconds)).isoformat()
@@ -299,27 +351,11 @@ class SQLiteAliasCache:
             conn.execute("DELETE FROM forwarded_messages WHERE forwarded_at < ?", (cutoff,))
             conn.execute(
                 """
-                INSERT INTO forwarded_messages (fingerprint, forwarded_at)
-                VALUES (?, ?)
-                ON CONFLICT(fingerprint) DO UPDATE SET forwarded_at=excluded.forwarded_at
+                INSERT INTO forwarded_messages (fingerprint, forwarded_at, status)
+                VALUES (?, ?, 'completed')
+                ON CONFLICT(fingerprint) DO UPDATE SET
+                  forwarded_at = excluded.forwarded_at,
+                  status = 'completed'
                 """,
                 (fingerprint, now_dt.isoformat()),
             )
-
-    def was_recently_forwarded(self, fingerprint: str, ttl_seconds: int) -> bool:
-        if ttl_seconds <= 0:
-            return False
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT forwarded_at FROM forwarded_messages WHERE fingerprint = ?",
-                (fingerprint,),
-            ).fetchone()
-        if not row or not row[0]:
-            return False
-        try:
-            forwarded_at = datetime.fromisoformat(row[0])
-        except ValueError:
-            return False
-        if forwarded_at.tzinfo is None:
-            forwarded_at = forwarded_at.replace(tzinfo=timezone.utc)
-        return datetime.now(timezone.utc) - forwarded_at <= timedelta(seconds=ttl_seconds)

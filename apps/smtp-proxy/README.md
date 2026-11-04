@@ -122,12 +122,18 @@ happened upstream.
 This closes one, but not all, of the gaps that made a client-side retry risk
 sending the same message twice: by default
 (`SMTP_PROXY_DUPLICATE_SUPPRESSION_WINDOW_SECONDS=86400`), the proxy
-fingerprints every message it forwards (its `Message-Id`, or a content hash
-if that header is absent, plus its envelope sender and rewritten recipients)
-and keeps that fingerprint in the local SQLite cache. A resubmission that
-matches a fingerprint forwarded within the window is rejected with `550
-Duplicate submission suppressed` instead of being sent again. Set the window
-to `0` to disable this check entirely.
+fingerprints every message it is about to forward (its `Message-Id`, or a
+content hash if that header is absent, plus its envelope sender and
+rewritten recipients) and atomically reserves that fingerprint in the local
+SQLite cache *before* forwarding starts, releasing the reservation again if
+forwarding fails. Reserving up front (rather than only recording success
+afterward) closes the race where a client disconnects mid-send and
+immediately retries: both submissions would otherwise be able to pass a
+simple "was this forwarded already?" check before either one finishes, and
+both would be sent. A resubmission that matches a fingerprint already
+reserved or forwarded within the window is rejected with `550 Duplicate
+submission suppressed` instead of being sent again. Set the window to `0`
+to disable this check entirely.
 
 This is a best-effort safeguard, not a delivery guarantee: a mail client that
 assigns a new `Message-Id` on every retry (rather than resending the exact

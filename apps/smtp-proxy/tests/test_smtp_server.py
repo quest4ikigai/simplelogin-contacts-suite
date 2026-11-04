@@ -2243,6 +2243,79 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             await proxy.stop()
             upstream.stop(no_assert=True)
 
+    async def test_concurrent_retry_while_first_send_still_in_flight_is_suppressed(self):
+        # Regression for the race Codex flagged: a client that disconnects
+        # during a slow upstream send and immediately retries can have both
+        # submissions pass a duplicate check before either one finishes
+        # forwarding. The fingerprint must be reserved atomically up front
+        # (before forwarding even starts), not only recorded after a
+        # successful send, so the retry is rejected while the first send is
+        # still blocked in flight -- not merely after it completes.
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        real_forwarder = UpstreamSmtpForwarder(
+            SmtpProxyConfig(upstream_host="127.0.0.1", upstream_port=upstream_port)
+        )
+        blocking_forwarder = BlockingForwarder(real_forwarder)
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+            ),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+            forwarder=blocking_forwarder,
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["Message-Id"] = "<fixed-id@example.com>"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            loop = asyncio.get_running_loop()
+            first_send = loop.run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+
+            started = await loop.run_in_executor(None, blocking_forwarder.started.wait, 2.0)
+            self.assertTrue(started, "forward() never started")
+
+            # The first forward is still blocked -- nothing has been marked
+            # as successfully forwarded yet. The identical retry must still
+            # be rejected as a duplicate right away rather than hanging or
+            # being forwarded a second time.
+            second = await asyncio.wait_for(
+                loop.run_in_executor(None, submit_message, proxy.port, msg, ["alice@example.com"]),
+                timeout=3.0,
+            )
+            self.assertEqual(second[0], 550)
+            self.assertIn("Duplicate submission suppressed", second[1])
+
+            blocking_forwarder.release.set()
+            completed = await loop.run_in_executor(None, blocking_forwarder.completed.wait, 3.0)
+            self.assertTrue(completed, "forward() never completed after being released")
+            first = await asyncio.wait_for(first_send, timeout=3.0)
+
+            self.assertEqual(first[0], 250)
+            self.assertEqual(len(upstream_handler.messages), 1)
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
     async def test_require_tls_refuses_start_until_tls_is_configured(self):
         tls_server = SmtpProxyServer(
             local_smtp_config(host="127.0.0.1", port=0, require_auth=True, require_tls=True)

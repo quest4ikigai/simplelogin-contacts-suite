@@ -345,7 +345,12 @@ class SmtpProxyHandler:
                     envelope.mail_from or "", transformed_recipients, transformed_message
                 )
                 try:
-                    is_duplicate = self._dedup_cache.was_recently_forwarded(
+                    # Atomically claim the fingerprint here, before forwarding,
+                    # rather than just checking it: a client that disconnects
+                    # during a slow upstream send and immediately retries would
+                    # otherwise have both submissions pass a read-only check
+                    # before either one records success, and both would forward.
+                    reserved = self._dedup_cache.try_reserve_forwarding(
                         fingerprint, self.config.duplicate_suppression_window_seconds
                     )
                 except Exception:
@@ -354,7 +359,8 @@ class SmtpProxyHandler:
                     # block legitimate mail. Fail open here and still try
                     # to forward normally.
                     LOGGER.exception("Duplicate-submission cache lookup failed; forwarding anyway")
-                    is_duplicate = False
+                    reserved = True
+                is_duplicate = not reserved
                 if is_duplicate:
                     LOGGER.info(
                         "audit %s",
@@ -431,24 +437,36 @@ class SmtpProxyHandler:
                 recipients,
                 message,
             )
-        except UpstreamForwardingError as exc:
-            LOGGER.info(
-                "audit %s",
-                audit_event(
-                    "smtp_message_rejected",
-                    peer=peer,
-                    correlation_id=correlation_id,
-                    policy="upstream_unavailable",
-                    reason=safe_reason(exc.public_message),
-                    recipient_count=len(recipients),
-                    forward_duration_ms=int((time.monotonic() - started) * 1000),
-                ),
-            )
+        except Exception as exc:
+            if fingerprint:
+                try:
+                    # Release the reservation so a genuine resend after a
+                    # failed delivery is not permanently blocked as a
+                    # "duplicate" of a message that never actually went out.
+                    self._dedup_cache.release_reservation(fingerprint)
+                except Exception:
+                    LOGGER.exception("Failed to release forwarded-message dedup reservation")
+            if isinstance(exc, UpstreamForwardingError):
+                LOGGER.info(
+                    "audit %s",
+                    audit_event(
+                        "smtp_message_rejected",
+                        peer=peer,
+                        correlation_id=correlation_id,
+                        policy="upstream_unavailable",
+                        reason=safe_reason(exc.public_message),
+                        recipient_count=len(recipients),
+                        forward_duration_ms=int((time.monotonic() - started) * 1000),
+                    ),
+                )
             raise
 
         if fingerprint:
             try:
-                self._dedup_cache.record_forwarded(fingerprint)
+                self._dedup_cache.mark_forwarded(
+                    fingerprint,
+                    prune_older_than_seconds=self.config.duplicate_suppression_window_seconds,
+                )
             except Exception:
                 LOGGER.exception("Failed to record forwarded-message dedup fingerprint")
         LOGGER.info(
