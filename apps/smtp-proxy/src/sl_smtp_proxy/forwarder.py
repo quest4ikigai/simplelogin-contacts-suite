@@ -62,40 +62,61 @@ class UpstreamSmtpForwarder:
         tls_mode = _upstream_tls_mode(self.config)
         tls_context = _upstream_tls_context(self.config) if tls_mode != "none" else None
 
+        # Managed manually rather than via `with smtp:`: that context
+        # manager's __exit__ sends QUIT and raises SMTPResponseException
+        # if the server's reply to it isn't 221. sendmail() returning
+        # without an exception already means the message was fully
+        # accepted (its own final 250 reply was received), so a QUIT-phase
+        # failure afterward -- a bad reply code, or the connection simply
+        # dropping -- must never be allowed to turn that confirmed
+        # delivery into a reported failure. It is purely post-delivery
+        # session teardown, swallowed unconditionally below.
         try:
-            with _connect_upstream(self.config, tls_mode, tls_context) as smtp:
-                smtp.ehlo()
-                if tls_mode == "starttls":
-                    smtp.starttls(context=tls_context)
-                    smtp.ehlo()
-                if self.config.upstream_username or self.config.upstream_password:
-                    smtp.login(self.config.upstream_username, self.config.upstream_password)
-                try:
-                    smtp.sendmail(
-                        sender,
-                        recipient_list,
-                        message.as_bytes(policy=policy.SMTP),
-                    )
-                except (
-                    smtplib.SMTPRecipientsRefused,
-                    smtplib.SMTPSenderRefused,
-                    smtplib.SMTPDataError,
-                ):
-                    # The server gave a definitive rejection reply (refused
-                    # the envelope, or replied with an error code to the
-                    # completed DATA command): nothing was or will be
-                    # delivered. Confirmed, not ambiguous.
-                    raise
-                except (OSError, smtplib.SMTPException) as exc:
-                    # The connection was lost or timed out while sendmail()
-                    # was transmitting the envelope/DATA or waiting for its
-                    # final reply. The message bytes may already be on the
-                    # wire (or even fully received and accepted) by the
-                    # time this happened, so whether anything was actually
-                    # delivered is unknown.
-                    self._raise_forwarding_error(exc, tls_mode, ambiguous_delivery=True)
+            smtp = _connect_upstream(self.config, tls_mode, tls_context)
         except (OSError, smtplib.SMTPException) as exc:
             self._raise_forwarding_error(exc, tls_mode, ambiguous_delivery=False)
+
+        try:
+            smtp.ehlo()
+            if tls_mode == "starttls":
+                smtp.starttls(context=tls_context)
+                smtp.ehlo()
+            if self.config.upstream_username or self.config.upstream_password:
+                smtp.login(self.config.upstream_username, self.config.upstream_password)
+            try:
+                smtp.sendmail(
+                    sender,
+                    recipient_list,
+                    message.as_bytes(policy=policy.SMTP),
+                )
+            except (
+                smtplib.SMTPRecipientsRefused,
+                smtplib.SMTPSenderRefused,
+                smtplib.SMTPDataError,
+            ):
+                # The server gave a definitive rejection reply (refused
+                # the envelope, or replied with an error code to the
+                # completed DATA command): nothing was or will be
+                # delivered. Confirmed, not ambiguous.
+                raise
+            except (OSError, smtplib.SMTPException) as exc:
+                # The connection was lost or timed out while sendmail()
+                # was transmitting the envelope/DATA or waiting for its
+                # final reply. The message bytes may already be on the
+                # wire (or even fully received and accepted) by the
+                # time this happened, so whether anything was actually
+                # delivered is unknown.
+                self._raise_forwarding_error(exc, tls_mode, ambiguous_delivery=True)
+        except (OSError, smtplib.SMTPException) as exc:
+            self._raise_forwarding_error(exc, tls_mode, ambiguous_delivery=False)
+        finally:
+            try:
+                smtp.quit()
+            except Exception:
+                try:
+                    smtp.close()
+                except Exception:
+                    pass
 
     def _raise_forwarding_error(
         self, exc: BaseException, tls_mode: str, *, ambiguous_delivery: bool

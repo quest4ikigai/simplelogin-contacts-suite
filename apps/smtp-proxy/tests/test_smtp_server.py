@@ -451,12 +451,10 @@ class UpstreamForwarderTests(unittest.TestCase):
 
     def test_upstream_starttls_uses_verifying_context_before_auth(self):
         smtp = mock.MagicMock()
-        smtp_cm = mock.MagicMock()
-        smtp_cm.__enter__.return_value = smtp
         tls_context = object()
 
         with mock.patch("sl_smtp_proxy.forwarder.ssl.create_default_context", return_value=tls_context):
-            with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp_cm) as smtp_cls:
+            with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp) as smtp_cls:
                 UpstreamSmtpForwarder(
                     SmtpProxyConfig(
                         upstream_tls_mode="starttls",
@@ -476,10 +474,8 @@ class UpstreamForwarderTests(unittest.TestCase):
 
     def test_upstream_starttls_verification_can_be_disabled(self):
         smtp = mock.MagicMock()
-        smtp_cm = mock.MagicMock()
-        smtp_cm.__enter__.return_value = smtp
 
-        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp_cm):
+        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp):
             UpstreamSmtpForwarder(
                 SmtpProxyConfig(
                     upstream_tls_mode="starttls",
@@ -493,12 +489,10 @@ class UpstreamForwarderTests(unittest.TestCase):
 
     def test_upstream_implicit_tls_uses_smtp_ssl(self):
         smtp = mock.MagicMock()
-        smtp_cm = mock.MagicMock()
-        smtp_cm.__enter__.return_value = smtp
         tls_context = object()
 
         with mock.patch("sl_smtp_proxy.forwarder.ssl.create_default_context", return_value=tls_context):
-            with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP_SSL", return_value=smtp_cm) as smtp_ssl_cls:
+            with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP_SSL", return_value=smtp) as smtp_ssl_cls:
                 with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP") as smtp_cls:
                     UpstreamSmtpForwarder(
                         SmtpProxyConfig(upstream_tls_mode="implicit")
@@ -585,14 +579,12 @@ class UpstreamForwarderTests(unittest.TestCase):
         # fields -- never the address itself.
         secret_address = "donor-alice-smith@example.com"
         smtp = mock.MagicMock()
-        smtp_cm = mock.MagicMock()
-        smtp_cm.__enter__.return_value = smtp
         smtp.sendmail.side_effect = smtplib.SMTPRecipientsRefused(
             {secret_address: (550, b"mailbox unavailable")}
         )
 
         logger = logging.getLogger("sl_smtp_proxy.forwarder")
-        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp_cm):
+        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp):
             with self.assertLogs(logger, level="WARNING") as captured:
                 with self.assertRaises(UpstreamForwardingError) as raised:
                     UpstreamSmtpForwarder(SmtpProxyConfig()).forward(
@@ -611,11 +603,9 @@ class UpstreamForwarderTests(unittest.TestCase):
         # A failure before any message data was sent (here: EHLO) means
         # nothing could possibly have been delivered.
         smtp = mock.MagicMock()
-        smtp_cm = mock.MagicMock()
-        smtp_cm.__enter__.return_value = smtp
         smtp.ehlo.side_effect = OSError("connection reset")
 
-        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp_cm):
+        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp):
             with self.assertRaises(UpstreamForwardingError) as raised:
                 UpstreamSmtpForwarder(SmtpProxyConfig()).forward(
                     "sender@example.com", ["recipient@example.com"], self._message()
@@ -629,13 +619,11 @@ class UpstreamForwarderTests(unittest.TestCase):
         # every recipient was rejected at the envelope stage: a definitive,
         # confirmed non-delivery.
         smtp = mock.MagicMock()
-        smtp_cm = mock.MagicMock()
-        smtp_cm.__enter__.return_value = smtp
         smtp.sendmail.side_effect = smtplib.SMTPRecipientsRefused(
             {"recipient@example.com": (550, b"mailbox unavailable")}
         )
 
-        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp_cm):
+        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp):
             with self.assertRaises(UpstreamForwardingError) as raised:
                 UpstreamSmtpForwarder(SmtpProxyConfig()).forward(
                     "sender@example.com", ["recipient@example.com"], self._message()
@@ -648,11 +636,9 @@ class UpstreamForwarderTests(unittest.TestCase):
         # reply was an error code: the server explicitly told us it did
         # not accept the message.
         smtp = mock.MagicMock()
-        smtp_cm = mock.MagicMock()
-        smtp_cm.__enter__.return_value = smtp
         smtp.sendmail.side_effect = smtplib.SMTPDataError(554, b"message rejected")
 
-        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp_cm):
+        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp):
             with self.assertRaises(UpstreamForwardingError) as raised:
                 UpstreamSmtpForwarder(SmtpProxyConfig()).forward(
                     "sender@example.com", ["recipient@example.com"], self._message()
@@ -673,17 +659,52 @@ class UpstreamForwarderTests(unittest.TestCase):
         ):
             with self.subTest(exc_type=type(exc).__name__):
                 smtp = mock.MagicMock()
-                smtp_cm = mock.MagicMock()
-                smtp_cm.__enter__.return_value = smtp
                 smtp.sendmail.side_effect = exc
 
-                with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp_cm):
+                with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp):
                     with self.assertRaises(UpstreamForwardingError) as raised:
                         UpstreamSmtpForwarder(SmtpProxyConfig()).forward(
                             "sender@example.com", ["recipient@example.com"], self._message()
                         )
 
                 self.assertTrue(raised.exception.ambiguous_delivery)
+
+    def test_quit_failure_after_successful_sendmail_is_not_reported(self):
+        # Regression for Codex's finding: smtplib.SMTP's own context
+        # manager sends QUIT on __exit__ and raises SMTPResponseException
+        # if the reply isn't 221. sendmail() already returning without an
+        # exception means the message was fully accepted; a QUIT-phase
+        # hiccup afterward must not turn that into a reported failure
+        # (which would previously have marked the dedup reservation
+        # 'failed' and let an immediate retry resend an already-delivered
+        # message).
+        smtp = mock.MagicMock()
+        smtp.quit.side_effect = smtplib.SMTPResponseException(500, b"QUIT not understood")
+
+        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp):
+            UpstreamSmtpForwarder(SmtpProxyConfig()).forward(
+                "sender@example.com", ["recipient@example.com"], self._message()
+            )
+
+        smtp.sendmail.assert_called_once()
+        smtp.quit.assert_called_once()
+
+    def test_quit_failure_after_send_failure_does_not_mask_original_error(self):
+        # A QUIT-phase failure on an already-doomed connection must never
+        # replace or hide the real error that caused sendmail() to fail
+        # in the first place.
+        smtp = mock.MagicMock()
+        smtp.sendmail.side_effect = smtplib.SMTPServerDisconnected("Connection unexpectedly closed")
+        smtp.quit.side_effect = OSError("socket already closed")
+
+        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp):
+            with self.assertRaises(UpstreamForwardingError) as raised:
+                UpstreamSmtpForwarder(SmtpProxyConfig()).forward(
+                    "sender@example.com", ["recipient@example.com"], self._message()
+                )
+
+        self.assertTrue(raised.exception.ambiguous_delivery)
+        self.assertIsInstance(raised.exception.__cause__, smtplib.SMTPServerDisconnected)
 
 
 class SmtpServerTests(unittest.IsolatedAsyncioTestCase):

@@ -167,6 +167,14 @@ response to a submission depends on which:
   resubmission is forwarded again like a fresh message. A connection lost
   or timed out *while* the message was already being transmitted is
   deliberately **not** treated as confirmed -- see "ambiguous" below.
+  Note that `forward()` manages its upstream connection manually rather
+  than via `smtplib.SMTP`'s own context manager: that context manager's
+  `__exit__` sends `QUIT` and raises on a non-221 reply, which, since
+  `sendmail()` had already returned successfully by that point, would
+  otherwise turn a *confirmed delivery* into a reported failure and let
+  an immediate retry resend an already-accepted message. A `QUIT`/close
+  failure is always swallowed as best-effort session teardown; it never
+  overrides the outcome `sendmail()` itself already established.
 - **Pending reservation abandoned (process killed mid-send).** The
   reservation's lease expired without being resolved into "completed" or
   "failed" -- most likely because the proxy process was killed or crashed
