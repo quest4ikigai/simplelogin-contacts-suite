@@ -134,14 +134,20 @@ happened upstream.
 This closes one, but not all, of the gaps that made a client-side retry risk
 sending the same message twice. By default
 (`SMTP_PROXY_DUPLICATE_SUPPRESSION_WINDOW_SECONDS=86400`), the proxy
-fingerprints every message it is about to forward (its `Message-Id`, or a
-content hash if that header is absent, plus its envelope sender and
-rewritten recipients) and atomically reserves that fingerprint in the local
-SQLite cache *before* forwarding starts. Reserving up front (rather than
-only recording success afterward) closes the race where a client
-disconnects mid-send and immediately retries: both submissions would
-otherwise be able to pass a simple "was this forwarded already?" check
-before either one finishes, and both would be sent.
+fingerprints every message it is about to forward (its envelope sender,
+rewritten recipients, `Message-Id` if present, and *always* a hash of the
+full serialized message) and atomically reserves that fingerprint in the
+local SQLite cache *before* forwarding starts. The content hash is
+included even when `Message-Id` is present -- not only as a fallback --
+so a client-side "edit and resend" that reuses the same `Message-Id`, or
+two separately imported messages that happen to share one, are never
+fingerprinted as the same message just because the sender, recipients,
+and `Message-Id` all match; only a byte-identical resubmission is ever
+suppressed. Reserving up front (rather than only recording success
+afterward) closes the race where a client disconnects mid-send and
+immediately retries: both submissions would otherwise be able to pass a
+simple "was this forwarded already?" check before either one finishes,
+and both would be sent.
 
 ### The duplicate-suppression state machine
 

@@ -36,6 +36,7 @@ from sl_smtp_proxy.config import SmtpProxyConfig, load_config_from_env
 from sl_smtp_proxy.config_validation import StartupConfigError
 from sl_smtp_proxy.forwarder import UpstreamForwardingError, UpstreamSmtpForwarder, safe_forwarding_error_fields
 from sl_smtp_proxy.healthcheck import check_health
+from sl_smtp_proxy.message_transform import apply_transform, build_plan_for_message
 from sl_smtp_proxy.smtp_server import SmtpProxyServer, _forward_fingerprint
 from alias_routing_core import TransformAction
 
@@ -439,6 +440,50 @@ def local_smtp_config(**overrides):
         os.path.join(tempfile.mkdtemp(prefix="sl-smtp-proxy-test-"), "cache.sqlite3"),
     )
     return SmtpProxyConfig(**values)
+
+
+class ForwardFingerprintTests(unittest.TestCase):
+    def _message(self, message_id, body):
+        msg = EmailMessage()
+        msg["From"] = "sender@example.com"
+        msg["To"] = "reply+alice@simplelogin.co"
+        if message_id is not None:
+            msg["Message-Id"] = message_id
+        msg.set_content(body)
+        return msg
+
+    def _fingerprint(self, message):
+        return _forward_fingerprint(
+            "sender@example.com", ["reply+alice@simplelogin.co"], message
+        )
+
+    def test_same_message_id_and_content_fingerprints_identically(self):
+        first = self._message("<reused@example.com>", "original body")
+        second = self._message("<reused@example.com>", "original body")
+
+        self.assertEqual(self._fingerprint(first), self._fingerprint(second))
+
+    def test_reused_message_id_with_different_content_does_not_collide(self):
+        # Regression for Codex's finding: a client-side "edit and resend"
+        # that reuses the same Message-Id, or two separately imported
+        # messages that happen to share one, must not be fingerprinted
+        # identically just because the Message-Id matches -- the sender
+        # and rewritten recipients can also remain identical while the
+        # body or subject changes. Doing so would silently drop the
+        # second, genuinely different message as "already delivered"
+        # without ever forwarding it.
+        original = self._message("<reused@example.com>", "original body")
+        edited = self._message("<reused@example.com>", "edited body")
+
+        self.assertNotEqual(self._fingerprint(original), self._fingerprint(edited))
+
+    def test_missing_message_id_still_distinguishes_by_content(self):
+        same_a = self._message(None, "same body")
+        same_b = self._message(None, "same body")
+        different = self._message(None, "different body")
+
+        self.assertEqual(self._fingerprint(same_a), self._fingerprint(same_b))
+        self.assertNotEqual(self._fingerprint(same_a), self._fingerprint(different))
 
 
 class UpstreamForwarderTests(unittest.TestCase):
@@ -3024,8 +3069,28 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             msg["X-SimpleLogin-Alias"] = "shopping@example.com"
             msg.set_content("classroom announcement")
 
+            # The real fingerprint is computed from the transformed
+            # message (after control headers are stripped and addresses
+            # are rewritten), not the raw submission -- mirror that here
+            # by running the same build_plan_for_message/apply_transform
+            # pipeline handle_DATA uses, rather than hand-duplicating what
+            # the transform does and risking it drifting out of sync. Use
+            # the exact bytes submit_message puts on the wire (including
+            # the trailing blank line SMTP's DATA framing adds before the
+            # terminating "."), not msg.as_bytes() directly, so the
+            # fingerprint computed here matches what the real submission
+            # below will actually hash.
+            wire_data = msg.as_bytes().replace(b"\n", b"\r\n") + b"\r\n"
+            parsed_message, plan = build_plan_for_message(
+                "sender@example.com",
+                ["alice@example.com"],
+                wire_data,
+                proxy.config,
+                reverse_alias_resolver=proxy.handler.reverse_alias_resolver,
+            )
+            transformed_message = apply_transform(parsed_message, plan, proxy.config)
             fingerprint = _forward_fingerprint(
-                "sender@example.com", ["reply+alice@simplelogin.co"], msg
+                "sender@example.com", ["reply+alice@simplelogin.co"], transformed_message
             )
             proxy.handler._dedup_cache.try_reserve_forwarding(
                 fingerprint,

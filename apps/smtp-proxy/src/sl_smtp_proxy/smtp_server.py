@@ -47,22 +47,28 @@ def _new_correlation_id() -> str:
 def _forward_fingerprint(sender: str, recipients: Sequence[str], message: Message) -> str:
     """Fingerprint a forwarded message for duplicate-submission suppression.
 
-    Prefers the message's own Message-Id (set once by the originating MUA
-    and normally preserved across a client-side retry of the same
-    compose) and falls back to a content hash when it is absent. This is
-    a best-effort defense, not a delivery guarantee: a client that
-    generates a new Message-Id per retry will not be caught by it.
+    Combines the message's own Message-Id (set once by the originating
+    MUA and normally preserved across a client-side retry of the same
+    compose) with a hash of the full serialized message, rather than
+    relying on Message-Id alone: a client-side "edit and resend" that
+    reuses the same Message-Id, or two separately imported messages that
+    happen to share one, can otherwise have identical sender/recipients/
+    Message-Id while their actual content differs, which would wrongly
+    fingerprint them as the same message -- reporting the second as
+    "already accepted for delivery" and silently never forwarding it.
+    Including the content hash even when Message-Id is present ensures
+    only byte-equivalent submissions are ever suppressed. This remains a
+    best-effort defense, not a delivery guarantee: a client that
+    generates a new Message-Id *and* content per retry will not be
+    caught by it.
     """
     message_id = (message.get("Message-Id") or "").strip()
-    if message_id:
-        content_key = message_id
-    else:
-        content_key = hashlib.sha256(message.as_bytes(policy=policy.SMTP)).hexdigest()
+    content_hash = hashlib.sha256(message.as_bytes(policy=policy.SMTP)).hexdigest()
     normalized_sender = normalize_email_address(sender) or (sender or "").casefold()
     normalized_recipients = sorted(
         normalize_email_address(recipient) or recipient.casefold() for recipient in recipients
     )
-    raw = "|".join([normalized_sender, ",".join(normalized_recipients), content_key])
+    raw = "|".join([normalized_sender, ",".join(normalized_recipients), message_id, content_hash])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
