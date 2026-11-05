@@ -70,72 +70,146 @@ class BulkContactCacheTests(unittest.TestCase):
 
 
 class ForwardedMessageDedupTests(unittest.TestCase):
+    """Covers the duplicate-suppression state machine: no prior submission,
+    forwarding pending, completed, failed, abandoned (lease expired after a
+    crash), and outcome-unknown (lease still alive, slow but not crashed).
+    """
+
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmpdir.cleanup)
         self.cache = SQLiteAliasCache(os.path.join(self.tmpdir.name, "cache.sqlite3"))
 
-    def test_fingerprint_claimable_until_reserved(self):
-        self.assertTrue(self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600))
+    def _reserve(self, fingerprint, attempt_id, window=3600, lease=60, grace=300):
+        return self.cache.try_reserve_forwarding(fingerprint, attempt_id, window, lease, grace)
 
-        self.assertFalse(self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600))
+    def test_fresh_fingerprint_is_claimed(self):
+        result = self._reserve("fp-1", "attempt-1")
 
-    def test_concurrent_reservation_of_same_fingerprint_is_rejected(self):
-        # Simulates a client disconnecting mid-send and immediately
-        # retrying before the first attempt has recorded success: only one
-        # of the two reservation attempts may succeed.
-        first = self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600)
-        second = self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600)
+        self.assertEqual(result.outcome, "claimed")
 
-        self.assertTrue(first)
-        self.assertFalse(second)
+    def test_concurrent_submission_while_pending_is_in_flight_not_rejected(self):
+        # Two identical concurrent submissions while the first is
+        # forwarding: the second must see "in_flight", not a permanent
+        # rejection -- the first attempt might still fail.
+        first = self._reserve("fp-1", "attempt-1")
+        second = self._reserve("fp-1", "attempt-2")
 
-    def test_mark_forwarded_keeps_fingerprint_reserved(self):
-        self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600)
-        self.cache.mark_forwarded("fp-1", prune_older_than_seconds=3600)
+        self.assertEqual(first.outcome, "claimed")
+        self.assertEqual(second.outcome, "in_flight")
+        self.assertEqual(second.prior_attempt_id, "attempt-1")
 
-        self.assertFalse(self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600))
+    def test_first_succeeds_after_second_observes_pending_state(self):
+        self._reserve("fp-1", "attempt-1")
+        pending_view = self._reserve("fp-1", "attempt-2")
+        self.cache.mark_forwarded("fp-1", "attempt-1", prune_older_than_seconds=3600)
 
-    def test_release_reservation_allows_retry_after_failure(self):
-        self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600)
-        self.cache.release_reservation("fp-1")
+        self.assertEqual(pending_view.outcome, "in_flight")
+        # Now that attempt-1 is confirmed complete, a later identical
+        # resubmission must be reported as already-delivered, not forwarded
+        # again and not permanently rejected as an error.
+        after = self._reserve("fp-1", "attempt-3")
+        self.assertEqual(after.outcome, "completed")
 
-        self.assertTrue(self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600))
+    def test_first_fails_after_second_observes_pending_state(self):
+        self._reserve("fp-1", "attempt-1")
+        pending_view = self._reserve("fp-1", "attempt-2")
+        self.cache.mark_failed("fp-1", "attempt-1", prune_older_than_seconds=3600)
 
-    def test_release_reservation_does_not_clear_a_completed_send(self):
-        self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600)
-        self.cache.mark_forwarded("fp-1", prune_older_than_seconds=3600)
-        self.cache.release_reservation("fp-1")
+        self.assertEqual(pending_view.outcome, "in_flight")
+        # Nothing was delivered, so a later resubmission must be allowed to
+        # actually retry rather than being told it already succeeded or
+        # permanently blocked.
+        after = self._reserve("fp-1", "attempt-3")
+        self.assertEqual(after.outcome, "claimed")
 
-        self.assertFalse(self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600))
+    def test_retry_after_confirmed_success_is_reported_as_already_delivered(self):
+        self._reserve("fp-1", "attempt-1")
+        self.cache.mark_forwarded("fp-1", "attempt-1", prune_older_than_seconds=3600)
 
-    def test_stale_reservation_respects_ttl(self):
-        self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600)
-        with self.cache.connect() as conn:
-            stale = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
-            conn.execute("UPDATE forwarded_messages SET forwarded_at = ? WHERE fingerprint = ?", (stale, "fp-1"))
+        result = self._reserve("fp-1", "attempt-2")
 
-        self.assertTrue(self.cache.try_reserve_forwarding("fp-1", ttl_seconds=60))
+        self.assertEqual(result.outcome, "completed")
+        self.assertEqual(result.prior_attempt_id, "attempt-1")
 
-    def test_zero_or_negative_ttl_disables_dedup(self):
-        self.cache.try_reserve_forwarding("fp-1", ttl_seconds=3600)
-        self.cache.mark_forwarded("fp-1", prune_older_than_seconds=3600)
+    def test_retry_after_confirmed_failure_is_allowed_through(self):
+        self._reserve("fp-1", "attempt-1")
+        self.cache.mark_failed("fp-1", "attempt-1", prune_older_than_seconds=3600)
 
-        self.assertTrue(self.cache.try_reserve_forwarding("fp-1", ttl_seconds=0))
+        result = self._reserve("fp-1", "attempt-2")
 
-    def test_mark_forwarded_prunes_old_entries(self):
-        self.cache.try_reserve_forwarding("fp-old", ttl_seconds=3600)
-        self.cache.mark_forwarded("fp-old", prune_older_than_seconds=3600)
-        with self.cache.connect() as conn:
-            ancient = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
-            conn.execute("UPDATE forwarded_messages SET forwarded_at = ? WHERE fingerprint = ?", (ancient, "fp-old"))
+        self.assertEqual(result.outcome, "claimed")
 
-        self.cache.try_reserve_forwarding("fp-new", ttl_seconds=3600)
-        self.cache.mark_forwarded("fp-new", prune_older_than_seconds=30 * 24 * 3600)
+    def test_abandoned_reservation_within_grace_defers_without_reclaiming(self):
+        # Simulates a crash: the reservation was made but never resolved,
+        # and its lease has now expired. Still within the abandoned-
+        # reservation grace period, a resubmission must not assume the
+        # original was never delivered and must not forward on its behalf.
+        self._reserve("fp-1", "attempt-1", lease=5, grace=30)
+        self._age_fingerprint("fp-1", seconds=10)
 
+        result = self._reserve("fp-1", "attempt-2", lease=5, grace=30)
+
+        self.assertEqual(result.outcome, "abandoned")
+        self.assertEqual(result.prior_attempt_id, "attempt-1")
+        self.assertIsNotNone(result.age_seconds)
+
+    def test_abandoned_reservation_beyond_grace_is_reclaimed(self):
+        # Recovery: once the proxy has waited lease + grace with no
+        # resolution, it gives up waiting and reclaims the fingerprint,
+        # accepting the documented residual duplicate-delivery risk rather
+        # than blocking retries forever.
+        self._reserve("fp-1", "attempt-1", lease=5, grace=10)
+        self._age_fingerprint("fp-1", seconds=20)
+
+        result = self._reserve("fp-1", "attempt-2", lease=5, grace=10)
+
+        self.assertEqual(result.outcome, "claimed")
+
+    def test_renewed_lease_keeps_a_slow_forward_in_flight_not_abandoned(self):
+        # A forwarding operation that remains in progress beyond the
+        # *normal* reservation window must not look abandoned just because
+        # it is slow: as long as it keeps renewing its lease, a concurrent
+        # retry still sees "in_flight", never "abandoned" or "claimed".
+        self._reserve("fp-1", "attempt-1", lease=5, grace=30)
+        self._age_fingerprint("fp-1", seconds=4)
+        renewed = self.cache.renew_reservation("fp-1", "attempt-1")
+        self._age_fingerprint("fp-1", seconds=4)
+
+        result = self._reserve("fp-1", "attempt-2", lease=5, grace=30)
+
+        self.assertTrue(renewed)
+        self.assertEqual(result.outcome, "in_flight")
+
+    def test_renew_reservation_reports_false_once_resolved(self):
+        self._reserve("fp-1", "attempt-1")
+        self.cache.mark_forwarded("fp-1", "attempt-1", prune_older_than_seconds=3600)
+
+        self.assertFalse(self.cache.renew_reservation("fp-1", "attempt-1"))
+
+    def test_renew_reservation_reports_false_for_wrong_attempt(self):
+        self._reserve("fp-1", "attempt-1")
+
+        self.assertFalse(self.cache.renew_reservation("fp-1", "attempt-2"))
+
+    def test_zero_or_negative_window_disables_dedup(self):
+        result = self.cache.try_reserve_forwarding(
+            "fp-1", "attempt-1", suppression_window_seconds=0, lease_seconds=60, abandoned_grace_seconds=300
+        )
+
+        self.assertEqual(result.outcome, "claimed")
         with self.cache.connect() as conn:
             rows = conn.execute("SELECT fingerprint FROM forwarded_messages").fetchall()
-        self.assertEqual([row[0] for row in rows], ["fp-new"])
+        self.assertEqual(rows, [])
+
+    def test_completed_entry_older_than_window_is_reclaimed(self):
+        self._reserve("fp-1", "attempt-1", window=3600)
+        self.cache.mark_forwarded("fp-1", "attempt-1", prune_older_than_seconds=3600)
+        self._age_fingerprint("fp-1", seconds=7200)
+
+        result = self._reserve("fp-1", "attempt-2", window=3600)
+
+        self.assertEqual(result.outcome, "claimed")
 
     def test_mark_forwarded_prunes_using_configured_window_not_a_fixed_default(self):
         # A window configured above 30 days must not have its entries
@@ -143,21 +217,24 @@ class ForwardedMessageDedupTests(unittest.TestCase):
         # actual configured suppression window so entries remain eligible
         # for suppression for as long as the operator configured.
         window_seconds = 45 * 24 * 3600
-        self.cache.try_reserve_forwarding("fp-old", ttl_seconds=window_seconds)
-        self.cache.mark_forwarded("fp-old", prune_older_than_seconds=window_seconds)
-        with self.cache.connect() as conn:
-            forty_days_ago = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
-            conn.execute(
-                "UPDATE forwarded_messages SET forwarded_at = ? WHERE fingerprint = ?",
-                (forty_days_ago, "fp-old"),
-            )
+        self._reserve("fp-old", "attempt-1", window=window_seconds)
+        self.cache.mark_forwarded("fp-old", "attempt-1", prune_older_than_seconds=window_seconds)
+        self._age_fingerprint("fp-old", seconds=40 * 24 * 3600)
 
-        self.cache.try_reserve_forwarding("fp-new", ttl_seconds=window_seconds)
-        self.cache.mark_forwarded("fp-new", prune_older_than_seconds=window_seconds)
+        self._reserve("fp-new", "attempt-2", window=window_seconds)
+        self.cache.mark_forwarded("fp-new", "attempt-2", prune_older_than_seconds=window_seconds)
 
         with self.cache.connect() as conn:
             rows = {row[0] for row in conn.execute("SELECT fingerprint FROM forwarded_messages").fetchall()}
         self.assertIn("fp-old", rows)
+
+    def _age_fingerprint(self, fingerprint: str, seconds: int) -> None:
+        with self.cache.connect() as conn:
+            aged = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+            conn.execute(
+                "UPDATE forwarded_messages SET forwarded_at = ? WHERE fingerprint = ?",
+                (aged, fingerprint),
+            )
 
 
 if __name__ == "__main__":

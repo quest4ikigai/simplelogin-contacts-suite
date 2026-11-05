@@ -21,10 +21,10 @@ from aiosmtpd.smtp import AuthResult, LoginPassword, SMTP
 from alias_routing_core import normalize_email_address
 from simplelogin_client import RequestStats
 
-from .cache import SQLiteAliasCache
+from .cache import ReservationResult, SQLiteAliasCache
 from .config import SmtpProxyConfig
 from .config_validation import validate_startup_config
-from .forwarder import UpstreamForwardingError, UpstreamSmtpForwarder
+from .forwarder import UpstreamForwardingError, UpstreamSmtpForwarder, safe_forwarding_error_fields
 from .logging import audit_event, plan_audit_fields, plan_summary, redact_address, safe_reason
 from .message_transform import (
     apply_transform,
@@ -350,8 +350,12 @@ class SmtpProxyHandler:
                     # during a slow upstream send and immediately retries would
                     # otherwise have both submissions pass a read-only check
                     # before either one records success, and both would forward.
-                    reserved = self._dedup_cache.try_reserve_forwarding(
-                        fingerprint, self.config.duplicate_suppression_window_seconds
+                    reservation = self._dedup_cache.try_reserve_forwarding(
+                        fingerprint,
+                        correlation_id,
+                        self.config.duplicate_suppression_window_seconds,
+                        self.config.duplicate_reservation_lease_seconds,
+                        self.config.duplicate_reservation_abandoned_grace_seconds,
                     )
                 except Exception:
                     # Duplicate suppression is a best-effort safety net, not
@@ -359,23 +363,59 @@ class SmtpProxyHandler:
                     # block legitimate mail. Fail open here and still try
                     # to forward normally.
                     LOGGER.exception("Duplicate-submission cache lookup failed; forwarding anyway")
-                    reserved = True
-                is_duplicate = not reserved
-                if is_duplicate:
+                    reservation = ReservationResult(outcome="claimed")
+
+                if reservation.outcome == "completed":
+                    # The upstream SMTP server already accepted this exact
+                    # message within the suppression window. Report the
+                    # already-known success rather than forwarding (and
+                    # therefore delivering) it a second time.
                     LOGGER.info(
                         "audit %s",
                         audit_event(
-                            "smtp_message_rejected",
+                            "smtp_duplicate_already_delivered",
                             peer=peer,
                             correlation_id=correlation_id,
-                            policy="duplicate_suppressed",
-                            reason="duplicate_suppressed",
+                            policy="duplicate_already_delivered",
+                            prior_correlation_id=reservation.prior_attempt_id or "unknown",
+                            recipient_count=len(transformed_recipients),
+                        ),
+                    )
+                    return "250 Message already accepted for delivery"
+
+                if reservation.outcome in ("in_flight", "abandoned"):
+                    # A matching submission is either genuinely still being
+                    # forwarded ("in_flight") or its reservation lease
+                    # expired without being resolved, most likely because
+                    # the proxy process was killed mid-send ("abandoned").
+                    # Neither case tells us the original message was never
+                    # delivered, so forwarding this one now could create a
+                    # duplicate. Defer with a temporary response instead of
+                    # a permanent one: a legitimate client should retry
+                    # later rather than treat this as a hard bounce.
+                    LOGGER.info(
+                        "audit %s",
+                        audit_event(
+                            "smtp_message_deferred",
+                            peer=peer,
+                            correlation_id=correlation_id,
+                            policy=(
+                                "duplicate_in_flight"
+                                if reservation.outcome == "in_flight"
+                                else "duplicate_reservation_abandoned"
+                            ),
+                            prior_correlation_id=reservation.prior_attempt_id or "unknown",
+                            reservation_age_ms=(
+                                int(reservation.age_seconds * 1000)
+                                if reservation.age_seconds is not None
+                                else None
+                            ),
                             recipient_count=len(transformed_recipients),
                         ),
                     )
                     return (
-                        "550 Duplicate submission suppressed: an identical message "
-                        "was already forwarded recently"
+                        "451 A matching submission is already being processed or its "
+                        "delivery outcome is not yet confirmed; please retry shortly"
                     )
 
             # Forwarding runs as an independent, shielded task: if the
@@ -404,6 +444,8 @@ class SmtpProxyHandler:
                 await asyncio.shield(forward_task)
             except UpstreamForwardingError as exc:
                 return f"550 {exc.public_message}"
+            except Exception:
+                return "451 SimpleLogin SMTP proxy internal error while forwarding"
             return "250 Message accepted for delivery"
         except asyncio.CancelledError:
             LOGGER.info(
@@ -418,6 +460,34 @@ class SmtpProxyHandler:
             )
             raise
 
+    def _dedup_prune_window_seconds(self) -> int:
+        # Pruning must never remove a row that is still meaningful: either
+        # still within the duplicate-suppression window, or still needed
+        # to detect an in-flight/abandoned reservation.
+        return max(
+            self.config.duplicate_suppression_window_seconds,
+            self.config.duplicate_reservation_lease_seconds
+            + self.config.duplicate_reservation_abandoned_grace_seconds,
+        )
+
+    async def _renew_reservation_periodically(self, fingerprint: str, attempt_id: str) -> None:
+        """Keep a pending reservation's lease alive while genuinely in
+        progress, so a slow-but-alive forward is never mistaken for an
+        abandoned (crashed) one just because it outlives the lease
+        duration. Runs until cancelled by the forwarding attempt that
+        started it, win or lose.
+        """
+        interval_seconds = max(0.1, self.config.duplicate_reservation_lease_seconds / 3)
+        try:
+            while True:
+                await asyncio.sleep(interval_seconds)
+                try:
+                    self._dedup_cache.renew_reservation(fingerprint, attempt_id)
+                except Exception:
+                    LOGGER.exception("Failed to renew duplicate-suppression reservation lease")
+        except asyncio.CancelledError:
+            pass
+
     async def _forward_and_record(
         self,
         correlation_id: str,
@@ -429,6 +499,11 @@ class SmtpProxyHandler:
         started: float,
     ) -> None:
         loop = asyncio.get_running_loop()
+        renew_task = None
+        if fingerprint:
+            renew_task = asyncio.ensure_future(
+                self._renew_reservation_periodically(fingerprint, correlation_id)
+            )
         try:
             await loop.run_in_executor(
                 self._forward_executor,
@@ -438,14 +513,28 @@ class SmtpProxyHandler:
                 message,
             )
         except Exception as exc:
-            if fingerprint:
+            forward_duration_ms = int((time.monotonic() - started) * 1000)
+            if fingerprint and isinstance(exc, UpstreamForwardingError):
+                # A confirmed failure: nothing was delivered, so the
+                # fingerprint is immediately eligible for a legitimate
+                # retry to reclaim (see try_reserve_forwarding).
                 try:
-                    # Release the reservation so a genuine resend after a
-                    # failed delivery is not permanently blocked as a
-                    # "duplicate" of a message that never actually went out.
-                    self._dedup_cache.release_reservation(fingerprint)
+                    self._dedup_cache.mark_failed(
+                        fingerprint,
+                        correlation_id,
+                        prune_older_than_seconds=self._dedup_prune_window_seconds(),
+                    )
                 except Exception:
-                    LOGGER.exception("Failed to release forwarded-message dedup reservation")
+                    LOGGER.exception("Failed to record forwarded-message dedup failure")
+            # else (fingerprint set but exc is not UpstreamForwardingError):
+            # the outcome is genuinely unknown -- this is not a confirmed
+            # failure, and forward() may have already handed the message
+            # to the upstream server before raising. Deliberately leave
+            # the reservation 'pending' rather than guess: a later
+            # resubmission's try_reserve_forwarding call will see it as
+            # in-flight, then abandoned once its lease expires, and only
+            # reclaim it (accepting the documented residual duplicate
+            # risk) after the abandoned-reservation grace period.
             if isinstance(exc, UpstreamForwardingError):
                 LOGGER.info(
                     "audit %s",
@@ -456,16 +545,46 @@ class SmtpProxyHandler:
                         policy="upstream_unavailable",
                         reason=safe_reason(exc.public_message),
                         recipient_count=len(recipients),
-                        forward_duration_ms=int((time.monotonic() - started) * 1000),
+                        forward_duration_ms=forward_duration_ms,
+                    ),
+                )
+            else:
+                # Every forwarding attempt must have an observable terminal
+                # outcome, including unexpected failures: an exception here
+                # must not disappear silently just because the submitting
+                # client already disconnected and nobody is left to read
+                # handle_DATA's return value. error_type/error_category are
+                # structured and sanitized (see safe_forwarding_error_fields)
+                # specifically so this can never leak recipient addresses,
+                # message content, or credentials embedded in exc's own
+                # message text.
+                LOGGER.info(
+                    "audit %s",
+                    audit_event(
+                        "smtp_forwarding_outcome_unknown",
+                        peer=peer,
+                        correlation_id=correlation_id,
+                        policy="internal_error",
+                        recipient_count=len(recipients),
+                        forward_duration_ms=forward_duration_ms,
+                        **safe_forwarding_error_fields(exc),
                     ),
                 )
             raise
+        finally:
+            if renew_task is not None:
+                renew_task.cancel()
+                try:
+                    await renew_task
+                except asyncio.CancelledError:
+                    pass
 
         if fingerprint:
             try:
                 self._dedup_cache.mark_forwarded(
                     fingerprint,
-                    prune_older_than_seconds=self.config.duplicate_suppression_window_seconds,
+                    correlation_id,
+                    prune_older_than_seconds=self._dedup_prune_window_seconds(),
                 )
             except Exception:
                 LOGGER.exception("Failed to record forwarded-message dedup fingerprint")

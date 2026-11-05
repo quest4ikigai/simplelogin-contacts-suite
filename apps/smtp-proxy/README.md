@@ -120,37 +120,133 @@ that -- but the operational logs are no longer silent about what actually
 happened upstream.
 
 This closes one, but not all, of the gaps that made a client-side retry risk
-sending the same message twice: by default
+sending the same message twice. By default
 (`SMTP_PROXY_DUPLICATE_SUPPRESSION_WINDOW_SECONDS=86400`), the proxy
 fingerprints every message it is about to forward (its `Message-Id`, or a
 content hash if that header is absent, plus its envelope sender and
 rewritten recipients) and atomically reserves that fingerprint in the local
-SQLite cache *before* forwarding starts, releasing the reservation again if
-forwarding fails. Reserving up front (rather than only recording success
-afterward) closes the race where a client disconnects mid-send and
-immediately retries: both submissions would otherwise be able to pass a
-simple "was this forwarded already?" check before either one finishes, and
-both would be sent. A resubmission that matches a fingerprint already
-reserved or forwarded within the window is rejected with `550 Duplicate
-submission suppressed` instead of being sent again. Set the window to `0`
-to disable this check entirely.
+SQLite cache *before* forwarding starts. Reserving up front (rather than
+only recording success afterward) closes the race where a client
+disconnects mid-send and immediately retries: both submissions would
+otherwise be able to pass a simple "was this forwarded already?" check
+before either one finishes, and both would be sent.
 
-This is a best-effort safeguard, not a delivery guarantee: a mail client that
-assigns a new `Message-Id` on every retry (rather than resending the exact
-same compose) will not be caught by it, and the proxy cannot make SMTP itself
-exactly-once. Treat the dedup window as reducing the odds of an accidental
-duplicate send after an ambiguous client disconnect, not eliminating them.
+### The duplicate-suppression state machine
+
+A fingerprint is always in exactly one of these states, and the proxy's
+response to a submission depends on which:
+
+- **No prior submission.** The fingerprint is unknown. The reservation is
+  claimed and the message is forwarded normally.
+- **Forwarding currently pending.** Another submission with the same
+  fingerprint is actively being forwarded right now (its lease -- see
+  below -- has not expired). The new submission is deferred with `451`, a
+  *temporary* failure: the client should retry later. It is never given a
+  permanent `550` here, because the in-flight attempt might still fail, in
+  which case this exact retry should go through.
+- **Forwarding completed successfully.** A matching message was already
+  forwarded within `SMTP_PROXY_DUPLICATE_SUPPRESSION_WINDOW_SECONDS`. The
+  proxy reports `250 Message already accepted for delivery` *without*
+  forwarding again, and logs an `smtp_duplicate_already_delivered` audit
+  event -- the client sees success, honestly, instead of either a spurious
+  error or a second delivery.
+- **Forwarding confirmed failed.** A matching attempt raised a confirmed
+  `UpstreamForwardingError` (e.g. the upstream rejected it, or was
+  unreachable). Nothing was delivered, so the fingerprint is immediately
+  reclaimable: a resubmission is forwarded again like a fresh message.
+- **Pending reservation abandoned (process killed mid-send).** The
+  reservation's lease expired without being resolved into "completed" or
+  "failed" -- most likely because the proxy process was killed or crashed
+  while forwarding was in progress. The proxy cannot assume the original
+  send never reached the upstream server, so it does not forward on its
+  behalf and does not treat it as a confirmed failure either: it defers
+  with `451` (audited as `duplicate_reservation_abandoned`) until the
+  abandoned-reservation grace period also elapses.
+- **Delivery outcome unknown (unexpected error, process still alive).** An
+  exception other than `UpstreamForwardingError` escaped forwarding (a bug,
+  not a normal upstream failure). The proxy cannot tell whether the
+  message reached the upstream server before the error, so it leaves the
+  reservation pending rather than guessing; it is then handled by the
+  *same* pending/abandoned logic above as time passes. See "Diagnostics
+  and logging" below for how this is still audited.
+
+### Leases, renewal, and recovering from a crash
+
+Two settings govern the "pending" state:
+
+```dotenv
+SMTP_PROXY_DUPLICATE_RESERVATION_LEASE_SECONDS=60
+SMTP_PROXY_DUPLICATE_RESERVATION_ABANDONED_GRACE_SECONDS=300
+```
+
+While a forward is genuinely in progress, the proxy renews its reservation's
+lease every `lease_seconds / 3` (at least every 0.1s) for as long as the
+forwarding task is alive -- so a slow-but-alive send is never mistaken for
+an abandoned one just because it outlives one lease interval. Only a
+process that is no longer running (crashed, killed, lost power) stops
+renewing, which is what actually distinguishes "still working" from
+"abandoned".
+
+Once a reservation's lease has expired *and* it has sat unresolved for
+longer than `lease_seconds + abandoned_grace_seconds` in total, the proxy
+gives up waiting on it and reclaims the fingerprint for the next matching
+submission, which is then forwarded for real. This is a deliberate,
+documented trade-off, not a solution to exactly-once delivery: if the
+original process happened to crash *after* the upstream server accepted
+the message but *before* the local reservation could be marked complete,
+this recovery path accepts a small residual risk of sending that message
+a second time, in exchange for not blocking legitimate retries forever.
+Widen the grace period if occasional stuck-looking retries are more
+acceptable to you than that small residual risk; narrow it if the reverse
+is true. Set `SMTP_PROXY_DUPLICATE_SUPPRESSION_WINDOW_SECONDS=0` to disable
+duplicate suppression (and the reservation/lease machinery with it)
+entirely.
+
+This remains a best-effort safeguard, not a delivery guarantee: a mail
+client that assigns a new `Message-Id` on every retry (rather than
+resending the exact same compose) will not be caught by it, and the proxy
+cannot make SMTP itself exactly-once. Treat all of the above as reducing
+the odds of an accidental duplicate send or a wrongly-rejected retry, not
+eliminating them.
+
+The `forwarded_messages` SQLite table gained a `status` column (`pending`,
+`completed`, or `failed`) and an `attempt_id` column in this change. Both
+are added with an additive, idempotent migration run on every connection,
+so an existing persistent `/data/cache.sqlite3` volume from an earlier
+version of this feature upgrades in place with no manual steps.
 
 ## Diagnostics and logging
 
 Each SMTP submission gets a short `correlation_id` that appears on every
-audit event logged for it (`smtp_transform_plan`, `smtp_message_forwarded`,
-`smtp_message_rejected`, `smtp_client_disconnected_during_processing`, etc.),
-so one submission's full lifecycle can be followed across both the event
-loop and worker-thread log lines. The `smtp_transform_plan` event also
-reports timing (`alias_refresh_ms`, `resolution_ms`,
-`transform_validate_ms`) and SimpleLogin API/cache efficiency
-(`simplelogin_request_count`, `simplelogin_request_duration_ms`,
+audit event logged for it, so one submission's full lifecycle can be
+followed across both the event loop and worker-thread log lines, even
+across a client disconnect. Every forwarding attempt reaches exactly one
+of these terminal audit events -- none of them is ever silently skipped:
+
+- `smtp_message_forwarded`: forwarded and accepted upstream.
+- `smtp_message_rejected` (`policy=upstream_unavailable`): a confirmed
+  forwarding failure (`UpstreamForwardingError`).
+- `smtp_forwarding_outcome_unknown` (`policy=internal_error`): an
+  unexpected, non-upstream exception during forwarding. Its effect on
+  upstream delivery is unknown, so it is deliberately *not* reported as a
+  confirmed failure; see "Delivery-state handling" above for how the
+  reservation itself is left to resolve this ambiguity over time. Carries
+  a sanitized `error_type`/`error_category` (and `smtp_code` /
+  `refused_recipient_count` where applicable) from
+  `safe_forwarding_error_fields()` -- never the raw exception text.
+- `smtp_message_deferred` (`policy=duplicate_in_flight` or
+  `duplicate_reservation_abandoned`): a matching submission is already
+  pending; see "Delivery-state handling" above.
+- `smtp_duplicate_already_delivered`: a matching submission already
+  completed; reported as success without forwarding again.
+- `smtp_client_disconnected_during_processing`: the submitting client
+  disconnected before a response could be sent, carrying the same
+  `correlation_id` as whichever of the above events eventually resolves
+  that submission's forwarding attempt.
+
+The `smtp_transform_plan` event also reports timing (`alias_refresh_ms`,
+`resolution_ms`, `transform_validate_ms`) and SimpleLogin API/cache
+efficiency (`simplelogin_request_count`, `simplelogin_request_duration_ms`,
 `cache_hit_count`, `cache_miss_count`, `contacts_found`, `contacts_created`)
 for that submission.
 
@@ -161,3 +257,17 @@ operation never leaks addresses through it. Set
 `SMTP_PROXY_AIOSMTPD_LOG_LEVEL=INFO` (or `DEBUG`) only for temporary protocol
 troubleshooting, with the explicit understanding that doing so exposes real
 recipient addresses in the logs.
+
+Separately, a forwarding exception's own text is never logged either, by
+either the `smtp-proxy` or `forwarder` loggers: `smtplib` exceptions such as
+`SMTPRecipientsRefused` embed every refused recipient's address, and
+`SMTPResponseException` (and subclasses like `SMTPDataError`) carry the
+upstream server's raw response text, which can itself echo an address back
+(for example `"553 mailbox name not allowed: alice@example.com"`).
+Truncating that text is not a safe mitigation, since the sensitive content
+can appear in the first few characters. `safe_forwarding_error_fields()` in
+`forwarder.py` reduces every forwarding exception -- expected `smtplib`
+failures and unexpected ones alike -- to a bounded, non-leaking summary
+(exception type name, a small fixed category label, a numeric SMTP
+response code when available, and a refused-recipient *count*, never the
+addresses themselves) before anything is logged or audited.

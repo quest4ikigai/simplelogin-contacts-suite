@@ -104,6 +104,8 @@ class SmtpProxyConfig:
     resolver_max_workers: int = 4
     forward_max_workers: int = 4
     duplicate_suppression_window_seconds: int = 86400
+    duplicate_reservation_lease_seconds: int = 60
+    duplicate_reservation_abandoned_grace_seconds: int = 300
 
     log_level: str = "INFO"
     aiosmtpd_log_level: str = "WARNING"
@@ -174,6 +176,12 @@ def load_config_from_env() -> SmtpProxyConfig:
         forward_max_workers=env_int("SMTP_PROXY_FORWARD_MAX_WORKERS", 4),
         duplicate_suppression_window_seconds=env_int(
             "SMTP_PROXY_DUPLICATE_SUPPRESSION_WINDOW_SECONDS", 86400
+        ),
+        duplicate_reservation_lease_seconds=env_int(
+            "SMTP_PROXY_DUPLICATE_RESERVATION_LEASE_SECONDS", 60
+        ),
+        duplicate_reservation_abandoned_grace_seconds=env_int(
+            "SMTP_PROXY_DUPLICATE_RESERVATION_ABANDONED_GRACE_SECONDS", 300
         ),
         log_level=os.environ.get("LOG_LEVEL", "INFO"),
         aiosmtpd_log_level=os.environ.get("SMTP_PROXY_AIOSMTPD_LOG_LEVEL", "WARNING"),

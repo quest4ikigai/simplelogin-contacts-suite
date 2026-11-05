@@ -5,13 +5,33 @@ import smtplib
 import ssl
 from email import policy
 from email.message import Message
-from typing import Iterable, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from .config import SmtpProxyConfig
 
 
 LOGGER = logging.getLogger(__name__)
 UPSTREAM_TLS_MODES = {"none", "starttls", "implicit"}
+
+# Ordered most-specific-first: smtplib's own exception hierarchy has several
+# subclasses of SMTPResponseException (auth, connect, data, sender/recipient
+# refusal, ...), so a generic SMTPResponseException check must come last
+# among them or it would mask the more specific category.
+_SMTP_ERROR_CATEGORIES = (
+    (smtplib.SMTPRecipientsRefused, "recipients_refused"),
+    (smtplib.SMTPAuthenticationError, "auth_failed"),
+    (smtplib.SMTPConnectError, "connect_failed"),
+    (smtplib.SMTPServerDisconnected, "server_disconnected"),
+    (smtplib.SMTPResponseException, "smtp_response_error"),
+    (smtplib.SMTPException, "smtp_protocol_error"),
+)
+_NETWORK_ERROR_CATEGORIES = (
+    (TimeoutError, "timeout"),
+    (ConnectionRefusedError, "connection_error"),
+    (ConnectionResetError, "connection_error"),
+    (ConnectionAbortedError, "connection_error"),
+    (OSError, "network_error"),
+)
 
 
 class UpstreamForwardingError(RuntimeError):
@@ -46,15 +66,20 @@ class UpstreamSmtpForwarder:
                     message.as_bytes(policy=policy.SMTP),
                 )
         except (OSError, smtplib.SMTPException) as exc:
+            error_fields = safe_forwarding_error_fields(exc)
             LOGGER.warning(
-                "upstream_smtp_forward_failed host=%s port=%s tls_mode=%s tls_verify=%s auth_configured=%s error_type=%s error=%s",
+                "upstream_smtp_forward_failed host=%s port=%s tls_mode=%s tls_verify=%s "
+                "auth_configured=%s error_type=%s error_category=%s smtp_code=%s "
+                "refused_recipient_count=%s",
                 self.config.upstream_host,
                 self.config.upstream_port,
                 tls_mode,
                 self.config.upstream_tls_verify,
                 bool(self.config.upstream_username or self.config.upstream_password),
-                type(exc).__name__,
-                _safe_error_message(exc),
+                error_fields["error_type"],
+                error_fields["error_category"],
+                error_fields.get("smtp_code", "none"),
+                error_fields.get("refused_recipient_count", "none"),
             )
             raise UpstreamForwardingError(
                 "Upstream SMTP unavailable. Message not sent to avoid unsafe delivery."
@@ -98,6 +123,34 @@ def _upstream_tls_context(config: SmtpProxyConfig) -> ssl.SSLContext:
     return context
 
 
-def _safe_error_message(exc: BaseException) -> str:
-    message = str(exc).replace("\n", " ").replace("\r", " ").strip()
-    return message[:300] if message else type(exc).__name__
+def safe_forwarding_error_fields(exc: BaseException) -> Dict[str, Any]:
+    """Structured, non-leaking classification of a forwarding exception.
+
+    Deliberately never touches str(exc) or exception attributes that can
+    carry recipient addresses, upstream response text, or credentials --
+    smtplib.SMTPRecipientsRefused embeds every refused address in
+    .recipients, and SMTPResponseException/subclasses carry the upstream
+    server's raw response text in .smtp_error, which can itself echo an
+    address back (e.g. "mailbox name not allowed: alice@example.com").
+    Truncating those strings is not enough, since the sensitive content
+    can appear in the first few characters. Only the exception's type
+    name, a bounded category label, a numeric SMTP response code, and a
+    recipient *count* are safe enough to log or audit as-is.
+    """
+    fields: Dict[str, Any] = {"error_type": type(exc).__name__}
+    smtp_code = getattr(exc, "smtp_code", None)
+    if isinstance(smtp_code, int):
+        fields["smtp_code"] = smtp_code
+    if isinstance(exc, smtplib.SMTPRecipientsRefused):
+        fields["refused_recipient_count"] = len(exc.recipients)
+
+    for exc_type, category in _SMTP_ERROR_CATEGORIES:
+        if isinstance(exc, exc_type):
+            fields["error_category"] = category
+            return fields
+    for exc_type, category in _NETWORK_ERROR_CATEGORIES:
+        if isinstance(exc, exc_type):
+            fields["error_category"] = category
+            return fields
+    fields["error_category"] = "unexpected"
+    return fields

@@ -7,6 +7,7 @@ from email.parser import BytesParser
 from email.utils import parseaddr
 import os
 import shutil
+import smtplib
 import socket
 import ssl
 import subprocess
@@ -32,9 +33,9 @@ sys.path.insert(0, os.path.abspath(SIMPLELOGIN_SRC))
 from sl_smtp_proxy.cache import SQLiteAliasCache
 from sl_smtp_proxy.config import SmtpProxyConfig, load_config_from_env
 from sl_smtp_proxy.config_validation import StartupConfigError
-from sl_smtp_proxy.forwarder import UpstreamSmtpForwarder
+from sl_smtp_proxy.forwarder import UpstreamForwardingError, UpstreamSmtpForwarder, safe_forwarding_error_fields
 from sl_smtp_proxy.healthcheck import check_health
-from sl_smtp_proxy.smtp_server import SmtpProxyServer
+from sl_smtp_proxy.smtp_server import SmtpProxyServer, _forward_fingerprint
 from alias_routing_core import TransformAction
 
 
@@ -364,6 +365,30 @@ class BlockingForwarder:
             self.completed.set()
 
 
+class AlwaysFailsForwarder:
+    """A forwarder whose forward() always raises a confirmed
+    UpstreamForwardingError, for exercising the "mark_failed" path
+    deterministically without depending on a real network failure.
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    def forward(self, sender, recipients, message):
+        self.calls += 1
+        raise UpstreamForwardingError("simulated confirmed forwarding failure")
+
+
+class AlwaysRaisesUnexpectedForwarder:
+    """A forwarder whose forward() raises an exception that is not
+    UpstreamForwardingError, simulating a bug or other unexpected failure
+    inside forwarding whose effect on upstream delivery is unknown.
+    """
+
+    def forward(self, sender, recipients, message):
+        raise RuntimeError("simulated unexpected forwarding bug")
+
+
 def _wait_until(predicate, timeout=2.0, interval=0.02):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -485,6 +510,84 @@ class UpstreamForwarderTests(unittest.TestCase):
 
         self.assertEqual(config.upstream_tls_mode, "implicit")
         self.assertFalse(config.upstream_tls_verify)
+
+    def test_safe_forwarding_error_fields_never_includes_refused_addresses(self):
+        # SMTPRecipientsRefused embeds every refused address (and the
+        # upstream's response text) in .recipients. The sanitizer must
+        # reduce this to a bounded, address-free summary.
+        secret_address = "donor-alice-smith@example.com"
+        exc = smtplib.SMTPRecipientsRefused(
+            {secret_address: (550, b"mailbox unavailable: " + secret_address.encode())}
+        )
+
+        fields = safe_forwarding_error_fields(exc)
+
+        self.assertEqual(fields["error_type"], "SMTPRecipientsRefused")
+        self.assertEqual(fields["error_category"], "recipients_refused")
+        self.assertEqual(fields["refused_recipient_count"], 1)
+        for value in fields.values():
+            self.assertNotIn(secret_address, str(value))
+
+    def test_safe_forwarding_error_fields_never_includes_response_text(self):
+        # SMTPResponseException (and subclasses like SMTPDataError) carry
+        # the raw upstream response text, which can itself echo back an
+        # address or other sensitive detail the server was given.
+        secret_text = "rejected recipient donor-bob@example.com for policy reasons"
+        exc = smtplib.SMTPDataError(554, secret_text.encode())
+
+        fields = safe_forwarding_error_fields(exc)
+
+        self.assertEqual(fields["smtp_code"], 554)
+        for value in fields.values():
+            self.assertNotIn("donor-bob", str(value))
+            self.assertNotIn(secret_text, str(value))
+
+    def test_safe_forwarding_error_fields_categorizes_common_failures(self):
+        cases = [
+            (smtplib.SMTPAuthenticationError(535, b"auth failed"), "auth_failed"),
+            (smtplib.SMTPConnectError(421, b"cannot connect"), "connect_failed"),
+            (smtplib.SMTPServerDisconnected("connection closed"), "server_disconnected"),
+            (smtplib.SMTPHeloError(500, b"helo rejected"), "smtp_response_error"),
+            (TimeoutError("timed out"), "timeout"),
+            (ConnectionRefusedError("refused"), "connection_error"),
+            (OSError("generic os error"), "network_error"),
+            (RuntimeError("some unrelated bug"), "unexpected"),
+        ]
+        for exc, expected_category in cases:
+            with self.subTest(exc_type=type(exc).__name__):
+                fields = safe_forwarding_error_fields(exc)
+                self.assertEqual(fields["error_category"], expected_category)
+                self.assertEqual(fields["error_type"], type(exc).__name__)
+                self.assertNotIn(str(exc), " ".join(str(v) for v in fields.values()))
+
+    def test_forward_warning_log_does_not_leak_refused_recipient_addresses(self):
+        # End-to-end through UpstreamSmtpForwarder.forward(): even though
+        # the upstream rejected a specific recipient by address, the
+        # WARNING log it emits must carry only structured, sanitized
+        # fields -- never the address itself.
+        secret_address = "donor-alice-smith@example.com"
+        smtp = mock.MagicMock()
+        smtp_cm = mock.MagicMock()
+        smtp_cm.__enter__.return_value = smtp
+        smtp.sendmail.side_effect = smtplib.SMTPRecipientsRefused(
+            {secret_address: (550, b"mailbox unavailable")}
+        )
+
+        logger = logging.getLogger("sl_smtp_proxy.forwarder")
+        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp_cm):
+            with self.assertLogs(logger, level="WARNING") as captured:
+                with self.assertRaises(UpstreamForwardingError) as raised:
+                    UpstreamSmtpForwarder(SmtpProxyConfig()).forward(
+                        "sender@example.com", [secret_address], self._message()
+                    )
+
+        for line in captured.output:
+            self.assertNotIn(secret_address, line)
+        self.assertIn("error_category=recipients_refused", captured.output[0])
+        self.assertIn("refused_recipient_count=1", captured.output[0])
+        # The client-visible message is a fixed, generic string -- never
+        # derived from the exception's own text.
+        self.assertNotIn(secret_address, raised.exception.public_message)
 
 
 class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
@@ -2150,7 +2253,115 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             await proxy.stop()
             upstream.stop(no_assert=True)
 
-    async def test_duplicate_submission_is_suppressed_without_resending(self):
+    async def test_unexpected_forwarding_exception_returns_temporary_failure_and_is_audited(self):
+        # An unexpected failure inside forwarding (not a confirmed
+        # UpstreamForwardingError) must not disappear silently, and must
+        # not be reported as success or as a confirmed, permanent
+        # failure: its effect on upstream delivery is unknown.
+        proxy = SmtpProxyServer(
+            local_smtp_config(host="127.0.0.1", port=0, require_auth=False, dry_run=False),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+            forwarder=AlwaysRaisesUnexpectedForwarder(),
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            with self.assertLogs("sl_smtp_proxy.smtp_server", level="INFO") as captured:
+                result = await asyncio.get_running_loop().run_in_executor(
+                    None, submit_message, proxy.port, msg, ["alice@example.com"]
+                )
+
+            self.assertEqual(result[0], 451)
+
+            audit_payloads = [
+                json.loads(line.split("audit ", 1)[1]) for line in captured.output if "audit " in line
+            ]
+            unknown_events = [
+                payload for payload in audit_payloads if payload["event"] == "smtp_forwarding_outcome_unknown"
+            ]
+            self.assertEqual(len(unknown_events), 1)
+            self.assertEqual(unknown_events[0]["policy"], "internal_error")
+            self.assertEqual(unknown_events[0]["error_type"], "RuntimeError")
+            self.assertIn("correlation_id", unknown_events[0])
+            # Never leak the raw exception text (it could contain
+            # addresses, content, or credentials) -- only the structured,
+            # sanitized fields from safe_forwarding_error_fields.
+            for line in captured.output:
+                self.assertNotIn("simulated unexpected forwarding bug", line)
+        finally:
+            await proxy.stop()
+
+    async def test_unexpected_forwarding_exception_after_disconnect_still_logs_audit_event(self):
+        # Same regression shape as the client-disconnect-during-forwarding
+        # test above, but for an unexpected (non-UpstreamForwardingError)
+        # exception: the outcome must still be observable, correlated to
+        # the same submission, even though nobody is left to read
+        # handle_DATA's return value.
+        unexpected_forwarder = AlwaysRaisesUnexpectedForwarder()
+        blocking_forwarder = BlockingForwarder(unexpected_forwarder)
+        proxy = SmtpProxyServer(
+            local_smtp_config(host="127.0.0.1", port=0, require_auth=False, dry_run=False),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+            forwarder=blocking_forwarder,
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            loop = asyncio.get_running_loop()
+            with self.assertLogs("sl_smtp_proxy.smtp_server", level="INFO") as captured:
+                disconnecting_send = loop.run_in_executor(
+                    None, submit_message_and_disconnect, proxy.port, msg, ["alice@example.com"]
+                )
+                started = await loop.run_in_executor(None, blocking_forwarder.started.wait, 2.0)
+                self.assertTrue(started, "forward() never started")
+                await asyncio.wait_for(disconnecting_send, timeout=3.0)
+
+                blocking_forwarder.release.set()
+                completed = await loop.run_in_executor(None, blocking_forwarder.completed.wait, 3.0)
+                self.assertTrue(completed, "forward() never completed after being released")
+
+                def _unknown_outcome_logged():
+                    return any(
+                        '"event":"smtp_forwarding_outcome_unknown"' in line for line in captured.output
+                    )
+
+                self.assertTrue(
+                    await _wait_until_async(_unknown_outcome_logged, timeout=2.0),
+                    "expected a smtp_forwarding_outcome_unknown audit event after disconnect",
+                )
+
+            audit_payloads = [
+                json.loads(line.split("audit ", 1)[1]) for line in captured.output if "audit " in line
+            ]
+            disconnect_events = [
+                payload
+                for payload in audit_payloads
+                if payload["event"] == "smtp_client_disconnected_during_processing"
+            ]
+            unknown_events = [
+                payload for payload in audit_payloads if payload["event"] == "smtp_forwarding_outcome_unknown"
+            ]
+            self.assertEqual(len(unknown_events), 1)
+            self.assertEqual(
+                disconnect_events[0]["correlation_id"], unknown_events[0]["correlation_id"]
+            )
+            for line in captured.output:
+                self.assertNotIn("simulated unexpected forwarding bug", line)
+        finally:
+            blocking_forwarder.release.set()
+            await proxy.stop()
+
+    async def test_duplicate_submission_of_a_completed_send_is_not_resent(self):
         upstream_handler = CaptureUpstreamHandler()
         upstream_port = free_port()
         upstream = Controller(
@@ -2189,8 +2400,12 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertEqual(first[0], 250)
-            self.assertEqual(second[0], 550)
-            self.assertIn("Duplicate submission suppressed", second[1])
+            # The first send already completed successfully: a resubmission
+            # of the exact same message is reported as already-accepted
+            # (250) rather than forwarded a second time, and rather than
+            # being permanently rejected (550) as if it were an error.
+            self.assertEqual(second[0], 250)
+            self.assertIn("already accepted", second[1].lower())
             self.assertEqual(len(upstream_handler.messages), 1)
         finally:
             await proxy.stop()
@@ -2249,8 +2464,12 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
         # submissions pass a duplicate check before either one finishes
         # forwarding. The fingerprint must be reserved atomically up front
         # (before forwarding even starts), not only recorded after a
-        # successful send, so the retry is rejected while the first send is
-        # still blocked in flight -- not merely after it completes.
+        # successful send, so the retry is deferred while the first send is
+        # still blocked in flight -- not merely after it completes. It must
+        # get a temporary (451) response, not a permanent (550) one: the
+        # first send might still fail, in which case this exact retry
+        # should be allowed through (see the follow-up finding on reserving
+        # fingerprints without permanently rejecting legitimate retries).
         upstream_handler = CaptureUpstreamHandler()
         upstream_port = free_port()
         upstream = Controller(
@@ -2295,21 +2514,353 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(started, "forward() never started")
 
             # The first forward is still blocked -- nothing has been marked
-            # as successfully forwarded yet. The identical retry must still
-            # be rejected as a duplicate right away rather than hanging or
-            # being forwarded a second time.
+            # as successfully forwarded yet. The identical retry must be
+            # deferred (temporary failure) right away, without hanging and
+            # without being forwarded a second time, but must NOT be
+            # permanently rejected: the first attempt's outcome isn't known
+            # yet, so a 550 here would be wrong if it later fails.
             second = await asyncio.wait_for(
                 loop.run_in_executor(None, submit_message, proxy.port, msg, ["alice@example.com"]),
                 timeout=3.0,
             )
-            self.assertEqual(second[0], 550)
-            self.assertIn("Duplicate submission suppressed", second[1])
-
+            # Release the blocked forward immediately, before asserting on
+            # `second`, so a failed assertion here never leaves a
+            # background thread stuck waiting on the upstream connection
+            # past the end of this test (which would otherwise delay the
+            # *next* test's asyncio teardown by however long that thread
+            # takes to unblock).
             blocking_forwarder.release.set()
+            self.assertEqual(second[0], 451)
+            self.assertIn("retry", second[1].lower())
+
             completed = await loop.run_in_executor(None, blocking_forwarder.completed.wait, 3.0)
             self.assertTrue(completed, "forward() never completed after being released")
             first = await asyncio.wait_for(first_send, timeout=3.0)
 
+            self.assertEqual(first[0], 250)
+            self.assertEqual(len(upstream_handler.messages), 1)
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
+    async def test_pending_then_completed_after_first_send_succeeds(self):
+        # "First submission succeeds after the second encounters its
+        # pending state": the concurrent retry must see a temporary
+        # deferral while the first is in flight, and a *later* identical
+        # resubmission (after the first completes) must be reported as
+        # already-delivered rather than forwarded a second time.
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        real_forwarder = UpstreamSmtpForwarder(
+            SmtpProxyConfig(upstream_host="127.0.0.1", upstream_port=upstream_port)
+        )
+        blocking_forwarder = BlockingForwarder(real_forwarder)
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+            ),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+            forwarder=blocking_forwarder,
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["Message-Id"] = "<pending-then-completed@example.com>"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            loop = asyncio.get_running_loop()
+            first_send = loop.run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+            started = await loop.run_in_executor(None, blocking_forwarder.started.wait, 2.0)
+            self.assertTrue(started, "forward() never started")
+
+            pending = await asyncio.wait_for(
+                loop.run_in_executor(None, submit_message, proxy.port, msg, ["alice@example.com"]),
+                timeout=3.0,
+            )
+            blocking_forwarder.release.set()
+            self.assertEqual(pending[0], 451)
+
+            first = await asyncio.wait_for(first_send, timeout=3.0)
+            self.assertEqual(first[0], 250)
+
+            after = await loop.run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+            self.assertEqual(after[0], 250)
+            self.assertIn("already accepted", after[1].lower())
+            self.assertEqual(len(upstream_handler.messages), 1)
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
+    async def test_pending_then_retryable_after_first_send_fails(self):
+        # "First submission fails after the second encounters its pending
+        # state": the concurrent retry must still see a temporary
+        # deferral (not an immediate failure or success guess), and once
+        # the first attempt is confirmed to have failed, a resubmission of
+        # the exact same message must be allowed to actually retry.
+        failing_forwarder = AlwaysFailsForwarder()
+        blocking_forwarder = BlockingForwarder(failing_forwarder)
+        proxy = SmtpProxyServer(
+            local_smtp_config(host="127.0.0.1", port=0, require_auth=False, dry_run=False),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+            forwarder=blocking_forwarder,
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["Message-Id"] = "<pending-then-failed@example.com>"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            loop = asyncio.get_running_loop()
+            first_send = loop.run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+            started = await loop.run_in_executor(None, blocking_forwarder.started.wait, 2.0)
+            self.assertTrue(started, "forward() never started")
+
+            pending = await asyncio.wait_for(
+                loop.run_in_executor(None, submit_message, proxy.port, msg, ["alice@example.com"]),
+                timeout=3.0,
+            )
+            blocking_forwarder.release.set()
+            self.assertEqual(pending[0], 451)
+
+            first = await asyncio.wait_for(first_send, timeout=3.0)
+            self.assertEqual(first[0], 550)
+
+            # Nothing was delivered, so this retry must actually reach
+            # forwarding again (not be answered from a cached rejection):
+            # the distinctive failure text and the call count both prove
+            # forward() ran a second time.
+            retry = await loop.run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+            self.assertEqual(retry[0], 550)
+            self.assertIn("simulated confirmed forwarding failure", retry[1])
+            self.assertEqual(failing_forwarder.calls, 2)
+        finally:
+            await proxy.stop()
+
+    async def test_retry_after_confirmed_upstream_failure_is_forwarded_again(self):
+        dead_port = free_port()
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=dead_port,
+            ),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+        )
+        await proxy.start()
+        upstream = None
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["Message-Id"] = "<confirmed-failure-retry@example.com>"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            first = await asyncio.get_running_loop().run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+            self.assertEqual(first[0], 550)
+            self.assertIn("Upstream SMTP unavailable", first[1])
+
+            # Nothing was delivered. Bring a real upstream server up on
+            # the exact port the proxy is already configured for, then
+            # resubmit the identical message: this must be allowed to
+            # actually retry forwarding rather than being rejected as a
+            # duplicate of a message that was never sent.
+            upstream_handler = CaptureUpstreamHandler()
+            upstream = Controller(
+                upstream_handler,
+                hostname="127.0.0.1",
+                port=dead_port,
+                decode_data=False,
+                ready_timeout=5.0,
+            )
+            upstream.start()
+
+            second = await asyncio.get_running_loop().run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+            self.assertEqual(second[0], 250)
+            self.assertEqual(len(upstream_handler.messages), 1)
+        finally:
+            await proxy.stop()
+            if upstream is not None:
+                upstream.stop(no_assert=True)
+
+    async def test_abandoned_reservation_defers_then_recovers_after_grace_period(self):
+        # Simulates a crash: a reservation is made for a fingerprint and
+        # then simply never resolved (no renewal, no mark_forwarded/
+        # mark_failed), as if the process died mid-send. A short lease and
+        # grace period make this test fast without any timestamp hacking.
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+                duplicate_reservation_lease_seconds=1,
+                duplicate_reservation_abandoned_grace_seconds=1,
+            ),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["Message-Id"] = "<abandoned-recovery@example.com>"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            fingerprint = _forward_fingerprint(
+                "sender@example.com", ["reply+alice@simplelogin.co"], msg
+            )
+            proxy.handler._dedup_cache.try_reserve_forwarding(
+                fingerprint,
+                "crashed-attempt",
+                suppression_window_seconds=3600,
+                lease_seconds=1,
+                abandoned_grace_seconds=1,
+            )
+
+            # Lease expired (>1s) but still within the abandoned-grace
+            # window (<2s total): defer, and the audit trail must say so
+            # explicitly rather than looking like an ordinary in-flight
+            # duplicate.
+            await asyncio.sleep(1.2)
+            with self.assertLogs("sl_smtp_proxy.smtp_server", level="INFO") as captured:
+                deferred = await asyncio.get_running_loop().run_in_executor(
+                    None, submit_message, proxy.port, msg, ["alice@example.com"]
+                )
+            self.assertEqual(deferred[0], 451)
+            self.assertTrue(
+                any("duplicate_reservation_abandoned" in line for line in captured.output)
+            )
+            self.assertEqual(upstream_handler.messages, [])
+
+            # Beyond lease + grace entirely: the proxy gives up waiting on
+            # the crashed attempt and reclaims the fingerprint for real.
+            await asyncio.sleep(1.2)
+            recovered = await asyncio.get_running_loop().run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+            self.assertEqual(recovered[0], 250)
+            self.assertEqual(len(upstream_handler.messages), 1)
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
+    async def test_slow_genuine_forward_renews_lease_and_is_not_abandoned(self):
+        # A forwarding operation that remains in progress beyond the
+        # normal reservation lease must not look abandoned just because
+        # it is slow: as long as it is still alive and renewing its
+        # lease, a concurrent duplicate must keep seeing "in_flight", and
+        # must never see "abandoned" or be allowed to forward itself.
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        real_forwarder = UpstreamSmtpForwarder(
+            SmtpProxyConfig(upstream_host="127.0.0.1", upstream_port=upstream_port)
+        )
+        blocking_forwarder = BlockingForwarder(real_forwarder)
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+                duplicate_reservation_lease_seconds=1,
+                duplicate_reservation_abandoned_grace_seconds=30,
+            ),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+            forwarder=blocking_forwarder,
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["Message-Id"] = "<slow-but-alive@example.com>"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            loop = asyncio.get_running_loop()
+            first_send = loop.run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+            started = await loop.run_in_executor(None, blocking_forwarder.started.wait, 2.0)
+            self.assertTrue(started, "forward() never started")
+
+            # Outlive the 1-second lease (by more than one renewal
+            # interval) while still blocked -- a crashed process could
+            # never do this, since nothing would be left alive to renew.
+            # Stay under submit_message's 2s client socket timeout, since
+            # first_send's own connection is still open and unanswered.
+            await asyncio.sleep(1.5)
+            with self.assertLogs("sl_smtp_proxy.smtp_server", level="INFO") as captured:
+                still_pending = await asyncio.wait_for(
+                    loop.run_in_executor(None, submit_message, proxy.port, msg, ["alice@example.com"]),
+                    timeout=3.0,
+                )
+            self.assertEqual(still_pending[0], 451)
+            self.assertTrue(any("duplicate_in_flight" in line for line in captured.output))
+            self.assertFalse(
+                any("duplicate_reservation_abandoned" in line for line in captured.output)
+            )
+
+            blocking_forwarder.release.set()
+            first = await asyncio.wait_for(first_send, timeout=3.0)
             self.assertEqual(first[0], 250)
             self.assertEqual(len(upstream_handler.messages), 1)
         finally:
