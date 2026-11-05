@@ -35,9 +35,19 @@ _NETWORK_ERROR_CATEGORIES = (
 
 
 class UpstreamForwardingError(RuntimeError):
-    def __init__(self, public_message: str):
+    def __init__(self, public_message: str, *, ambiguous_delivery: bool = False):
         super().__init__(public_message)
         self.public_message = public_message
+        # True when the failure occurred during or after the message bytes
+        # were already handed to the upstream server (e.g. the connection
+        # was lost or timed out while waiting for sendmail()'s final
+        # reply): the server may have already received and accepted the
+        # message, so this is not a confirmed non-delivery. False means
+        # the failure is known to have happened before any message data
+        # was sent (connect/EHLO/STARTTLS/AUTH, or a definitive rejection
+        # reply such as SMTPRecipientsRefused/SMTPSenderRefused/
+        # SMTPDataError), so nothing was delivered.
+        self.ambiguous_delivery = ambiguous_delivery
 
 
 class UpstreamSmtpForwarder:
@@ -60,30 +70,56 @@ class UpstreamSmtpForwarder:
                     smtp.ehlo()
                 if self.config.upstream_username or self.config.upstream_password:
                     smtp.login(self.config.upstream_username, self.config.upstream_password)
-                smtp.sendmail(
-                    sender,
-                    recipient_list,
-                    message.as_bytes(policy=policy.SMTP),
-                )
+                try:
+                    smtp.sendmail(
+                        sender,
+                        recipient_list,
+                        message.as_bytes(policy=policy.SMTP),
+                    )
+                except (
+                    smtplib.SMTPRecipientsRefused,
+                    smtplib.SMTPSenderRefused,
+                    smtplib.SMTPDataError,
+                ):
+                    # The server gave a definitive rejection reply (refused
+                    # the envelope, or replied with an error code to the
+                    # completed DATA command): nothing was or will be
+                    # delivered. Confirmed, not ambiguous.
+                    raise
+                except (OSError, smtplib.SMTPException) as exc:
+                    # The connection was lost or timed out while sendmail()
+                    # was transmitting the envelope/DATA or waiting for its
+                    # final reply. The message bytes may already be on the
+                    # wire (or even fully received and accepted) by the
+                    # time this happened, so whether anything was actually
+                    # delivered is unknown.
+                    self._raise_forwarding_error(exc, tls_mode, ambiguous_delivery=True)
         except (OSError, smtplib.SMTPException) as exc:
-            error_fields = safe_forwarding_error_fields(exc)
-            LOGGER.warning(
-                "upstream_smtp_forward_failed host=%s port=%s tls_mode=%s tls_verify=%s "
-                "auth_configured=%s error_type=%s error_category=%s smtp_code=%s "
-                "refused_recipient_count=%s",
-                self.config.upstream_host,
-                self.config.upstream_port,
-                tls_mode,
-                self.config.upstream_tls_verify,
-                bool(self.config.upstream_username or self.config.upstream_password),
-                error_fields["error_type"],
-                error_fields["error_category"],
-                error_fields.get("smtp_code", "none"),
-                error_fields.get("refused_recipient_count", "none"),
-            )
-            raise UpstreamForwardingError(
-                "Upstream SMTP unavailable. Message not sent to avoid unsafe delivery."
-            ) from exc
+            self._raise_forwarding_error(exc, tls_mode, ambiguous_delivery=False)
+
+    def _raise_forwarding_error(
+        self, exc: BaseException, tls_mode: str, *, ambiguous_delivery: bool
+    ) -> None:
+        error_fields = safe_forwarding_error_fields(exc)
+        LOGGER.warning(
+            "upstream_smtp_forward_failed host=%s port=%s tls_mode=%s tls_verify=%s "
+            "auth_configured=%s error_type=%s error_category=%s smtp_code=%s "
+            "refused_recipient_count=%s ambiguous_delivery=%s",
+            self.config.upstream_host,
+            self.config.upstream_port,
+            tls_mode,
+            self.config.upstream_tls_verify,
+            bool(self.config.upstream_username or self.config.upstream_password),
+            error_fields["error_type"],
+            error_fields["error_category"],
+            error_fields.get("smtp_code", "none"),
+            error_fields.get("refused_recipient_count", "none"),
+            ambiguous_delivery,
+        )
+        raise UpstreamForwardingError(
+            "Upstream SMTP unavailable. Message not sent to avoid unsafe delivery.",
+            ambiguous_delivery=ambiguous_delivery,
+        ) from exc
 
 
 def _connect_upstream(

@@ -9,6 +9,7 @@ import os
 import shutil
 import smtplib
 import socket
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -389,6 +390,23 @@ class AlwaysRaisesUnexpectedForwarder:
         raise RuntimeError("simulated unexpected forwarding bug")
 
 
+class AlwaysFailsAmbiguouslyForwarder:
+    """A forwarder whose forward() always raises an UpstreamForwardingError
+    flagged ambiguous_delivery=True, simulating a connection lost or timed
+    out while the message was already being transmitted: the upstream may
+    have already accepted it even though this call raised.
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    def forward(self, sender, recipients, message):
+        self.calls += 1
+        raise UpstreamForwardingError(
+            "simulated ambiguous forwarding failure", ambiguous_delivery=True
+        )
+
+
 def _wait_until(predicate, timeout=2.0, interval=0.02):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -588,6 +606,84 @@ class UpstreamForwarderTests(unittest.TestCase):
         # The client-visible message is a fixed, generic string -- never
         # derived from the exception's own text.
         self.assertNotIn(secret_address, raised.exception.public_message)
+
+    def test_connection_lost_before_sendmail_is_not_ambiguous(self):
+        # A failure before any message data was sent (here: EHLO) means
+        # nothing could possibly have been delivered.
+        smtp = mock.MagicMock()
+        smtp_cm = mock.MagicMock()
+        smtp_cm.__enter__.return_value = smtp
+        smtp.ehlo.side_effect = OSError("connection reset")
+
+        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp_cm):
+            with self.assertRaises(UpstreamForwardingError) as raised:
+                UpstreamSmtpForwarder(SmtpProxyConfig()).forward(
+                    "sender@example.com", ["recipient@example.com"], self._message()
+                )
+
+        self.assertFalse(raised.exception.ambiguous_delivery)
+        smtp.sendmail.assert_not_called()
+
+    def test_recipients_refused_during_sendmail_is_not_ambiguous(self):
+        # smtplib raises SMTPRecipientsRefused *before* sending DATA, when
+        # every recipient was rejected at the envelope stage: a definitive,
+        # confirmed non-delivery.
+        smtp = mock.MagicMock()
+        smtp_cm = mock.MagicMock()
+        smtp_cm.__enter__.return_value = smtp
+        smtp.sendmail.side_effect = smtplib.SMTPRecipientsRefused(
+            {"recipient@example.com": (550, b"mailbox unavailable")}
+        )
+
+        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp_cm):
+            with self.assertRaises(UpstreamForwardingError) as raised:
+                UpstreamSmtpForwarder(SmtpProxyConfig()).forward(
+                    "sender@example.com", ["recipient@example.com"], self._message()
+                )
+
+        self.assertFalse(raised.exception.ambiguous_delivery)
+
+    def test_data_error_with_definitive_reply_is_not_ambiguous(self):
+        # sendmail() got a final reply back from the server, and that
+        # reply was an error code: the server explicitly told us it did
+        # not accept the message.
+        smtp = mock.MagicMock()
+        smtp_cm = mock.MagicMock()
+        smtp_cm.__enter__.return_value = smtp
+        smtp.sendmail.side_effect = smtplib.SMTPDataError(554, b"message rejected")
+
+        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp_cm):
+            with self.assertRaises(UpstreamForwardingError) as raised:
+                UpstreamSmtpForwarder(SmtpProxyConfig()).forward(
+                    "sender@example.com", ["recipient@example.com"], self._message()
+                )
+
+        self.assertFalse(raised.exception.ambiguous_delivery)
+
+    def test_connection_lost_during_sendmail_is_ambiguous(self):
+        # Regression for Codex's finding: a connection lost or timed out
+        # while sendmail() was transmitting the envelope/DATA or waiting
+        # for a final reply must be flagged ambiguous -- the upstream may
+        # have already received and accepted the message bytes even
+        # though no confirmation reply ever arrived.
+        for exc in (
+            smtplib.SMTPServerDisconnected("Connection unexpectedly closed"),
+            TimeoutError("timed out"),
+            OSError("broken pipe"),
+        ):
+            with self.subTest(exc_type=type(exc).__name__):
+                smtp = mock.MagicMock()
+                smtp_cm = mock.MagicMock()
+                smtp_cm.__enter__.return_value = smtp
+                smtp.sendmail.side_effect = exc
+
+                with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp_cm):
+                    with self.assertRaises(UpstreamForwardingError) as raised:
+                        UpstreamSmtpForwarder(SmtpProxyConfig()).forward(
+                            "sender@example.com", ["recipient@example.com"], self._message()
+                        )
+
+                self.assertTrue(raised.exception.ambiguous_delivery)
 
 
 class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
@@ -2084,6 +2180,99 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             blocking_resolver.release.set()
             await proxy.stop()
 
+    async def test_server_remains_responsive_while_dedup_cache_is_locked(self):
+        # Regression for Codex's finding: try_reserve_forwarding() does a
+        # synchronous SQLite write. If the database file is locked by a
+        # concurrent writer, that write can block for SQLite's own busy
+        # timeout (default 5s). That must happen on the dedup executor,
+        # never directly on the event loop -- otherwise every other
+        # connection and health probe would stall for as long as the lock
+        # is held, exactly defeating the bounded-worker responsiveness
+        # fix from the original round of this PR.
+        cache_path = os.path.join(tempfile.mkdtemp(prefix="sl-smtp-proxy-test-"), "cache.sqlite3")
+        # Create the schema up front (on a throwaway cache instance) so
+        # the locking connection below doesn't race the proxy's own
+        # first-connect schema setup.
+        SQLiteAliasCache(cache_path).try_reserve_forwarding(
+            "warmup", "warmup-attempt", 3600, 60, 300
+        )
+
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+
+        locking_conn = sqlite3.connect(cache_path)
+        locking_conn.execute("BEGIN IMMEDIATE")
+        locking_conn.execute("UPDATE forwarded_messages SET status = status")
+        try:
+            proxy = SmtpProxyServer(
+                local_smtp_config(
+                    host="127.0.0.1",
+                    port=0,
+                    require_auth=False,
+                    dry_run=False,
+                    cache_path=cache_path,
+                    upstream_host="127.0.0.1",
+                    upstream_port=upstream_port,
+                ),
+                reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+            )
+            await proxy.start()
+            try:
+                msg = EmailMessage()
+                msg["From"] = "sender@example.com"
+                msg["To"] = "alice@example.com"
+                msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+                msg.set_content("classroom announcement")
+
+                loop = asyncio.get_running_loop()
+                locked_send = loop.run_in_executor(
+                    None, submit_message, proxy.port, msg, ["alice@example.com"]
+                )
+
+                # Give the background submission time to work through
+                # parsing/resolution/transform and reach the dedup write
+                # (there is no event to wait on for "about to write to
+                # the dedup cache" specifically, unlike the other blocking
+                # fixtures in this file) -- ample for local loopback
+                # round trips, so it is reliably blocked on locking_conn's
+                # lock by the time the probes below run.
+                await asyncio.sleep(0.3)
+
+                # While that submission's dedup-reservation write is stuck
+                # waiting on the lock held by locking_conn, a brand-new
+                # connection/health probe must still be served promptly.
+                probe_config = SmtpProxyConfig(host="127.0.0.1", port=proxy.port, require_auth=False)
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, check_health, probe_config, 2.0),
+                    timeout=3.0,
+                )
+                probe_result = await asyncio.wait_for(
+                    loop.run_in_executor(None, mail_from_response, proxy.port, "sender@example.com"),
+                    timeout=3.0,
+                )
+                self.assertEqual(probe_result[0], 250)
+            finally:
+                locking_conn.rollback()
+                locking_conn.close()
+
+            # Once the lock is released, the stuck submission must still
+            # complete (the duplicate-suppression cache failing open
+            # rather than ever blocking delivery).
+            result = await asyncio.wait_for(locked_send, timeout=10.0)
+            self.assertEqual(result[0], 250)
+            self.assertEqual(len(upstream_handler.messages), 1)
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
     async def test_client_disconnect_during_resolution_does_not_forward(self):
         blocking_resolver = BlockingResolver()
         upstream_handler = CaptureUpstreamHandler()
@@ -2660,6 +2849,66 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(retry[0], 550)
             self.assertIn("simulated confirmed forwarding failure", retry[1])
             self.assertEqual(failing_forwarder.calls, 2)
+        finally:
+            await proxy.stop()
+
+    async def test_ambiguous_forwarding_failure_leaves_reservation_pending(self):
+        # Regression for Codex's finding: a connection lost or timed out
+        # while the message bytes were already being transmitted must not
+        # be treated as a confirmed non-delivery. The failed attempt
+        # itself gets a temporary response, and an immediate identical
+        # resubmission must see the reservation as still unresolved
+        # (deferred, not retried) -- only after the full lease +
+        # abandoned-grace window does the proxy give up waiting and
+        # actually retry forwarding.
+        ambiguous_forwarder = AlwaysFailsAmbiguouslyForwarder()
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                duplicate_reservation_lease_seconds=1,
+                duplicate_reservation_abandoned_grace_seconds=1,
+            ),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+            forwarder=ambiguous_forwarder,
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["Message-Id"] = "<ambiguous-failure@example.com>"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            loop = asyncio.get_running_loop()
+            first = await loop.run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+            self.assertEqual(first[0], 451)
+            self.assertIn("confirmation", first[1].lower())
+            self.assertEqual(ambiguous_forwarder.calls, 1)
+
+            # Immediately after: the reservation is still pending (never
+            # marked failed), so this must be deferred, not retried.
+            immediate_retry = await loop.run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+            self.assertEqual(immediate_retry[0], 451)
+            self.assertIn("already being processed", immediate_retry[1])
+            self.assertEqual(ambiguous_forwarder.calls, 1)
+
+            # Beyond lease + grace, the proxy gives up waiting on the
+            # unresolved reservation and retries forwarding for real.
+            await asyncio.sleep(2.2)
+            recovered = await loop.run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+            self.assertEqual(recovered[0], 451)
+            self.assertIn("confirmation", recovered[1].lower())
+            self.assertEqual(ambiguous_forwarder.calls, 2)
         finally:
             await proxy.stop()
 

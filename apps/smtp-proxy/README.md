@@ -106,6 +106,14 @@ recipient resolution in flight against the SimpleLogin API at once.
 Both default to 4 and exist to cap thread/connection growth under concurrent
 load rather than to tune for a specific throughput target.
 
+The duplicate-suppression cache (below) gets its own small, fixed-size
+worker pool for the same reason resolution and forwarding do: SQLite can
+block a caller behind its own busy-timeout if the database file is
+locked by a concurrent writer (another connection's write, or a schema
+migration), and that wait must never happen directly on the event loop,
+or it would stall every other connection and health probe for as long
+as the lock is held.
+
 ## Delivery-state handling and duplicate submissions
 
 Forwarding to upstream SMTP runs as its own task, shielded from cancellation.
@@ -151,9 +159,14 @@ response to a submission depends on which:
   event -- the client sees success, honestly, instead of either a spurious
   error or a second delivery.
 - **Forwarding confirmed failed.** A matching attempt raised a confirmed
-  `UpstreamForwardingError` (e.g. the upstream rejected it, or was
-  unreachable). Nothing was delivered, so the fingerprint is immediately
-  reclaimable: a resubmission is forwarded again like a fresh message.
+  `UpstreamForwardingError` -- one known to have occurred *before* any
+  message data was sent (connection refused, EHLO/STARTTLS/AUTH failure)
+  or in response to the upstream's own definitive rejection reply
+  (`SMTPRecipientsRefused`, `SMTPSenderRefused`, `SMTPDataError`). Nothing
+  was delivered, so the fingerprint is immediately reclaimable: a
+  resubmission is forwarded again like a fresh message. A connection lost
+  or timed out *while* the message was already being transmitted is
+  deliberately **not** treated as confirmed -- see "ambiguous" below.
 - **Pending reservation abandoned (process killed mid-send).** The
   reservation's lease expired without being resolved into "completed" or
   "failed" -- most likely because the proxy process was killed or crashed
@@ -162,13 +175,19 @@ response to a submission depends on which:
   behalf and does not treat it as a confirmed failure either: it defers
   with `451` (audited as `duplicate_reservation_abandoned`) until the
   abandoned-reservation grace period also elapses.
-- **Delivery outcome unknown (unexpected error, process still alive).** An
-  exception other than `UpstreamForwardingError` escaped forwarding (a bug,
-  not a normal upstream failure). The proxy cannot tell whether the
-  message reached the upstream server before the error, so it leaves the
-  reservation pending rather than guessing; it is then handled by the
-  *same* pending/abandoned logic above as time passes. See "Diagnostics
-  and logging" below for how this is still audited.
+- **Delivery outcome unknown (ambiguous upstream failure, or an unexpected
+  error, while the process is still alive).** Two distinct situations
+  land here, both genuinely ambiguous: (1) an `UpstreamForwardingError`
+  whose underlying cause was a lost or timed-out connection *while*
+  `sendmail()` was transmitting the envelope or DATA, or waiting for its
+  final reply -- the upstream may have already received and accepted the
+  message bytes before this happened; and (2) any exception other than
+  `UpstreamForwardingError` escaping forwarding entirely (a bug, not a
+  normal upstream failure). In both cases the proxy cannot tell whether
+  the message reached the upstream server, so it leaves the reservation
+  pending rather than guessing; it is then handled by the *same*
+  pending/abandoned logic above as time passes. See "Diagnostics and
+  logging" below for how this is still audited.
 
 ### Leases, renewal, and recovering from a crash
 

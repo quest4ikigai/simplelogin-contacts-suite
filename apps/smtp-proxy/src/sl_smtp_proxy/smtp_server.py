@@ -141,10 +141,25 @@ class SmtpProxyHandler:
             max_workers=max(1, config.forward_max_workers),
             thread_name_prefix="sl-forward",
         )
+        # The duplicate-suppression cache does synchronous SQLite writes
+        # (reserve/renew/resolve). Each one is normally fast, but SQLite
+        # can block a caller behind its own busy-timeout if the database
+        # is locked by a concurrent writer (another connection's write, a
+        # schema migration) -- running that wait on the event loop thread
+        # would stall every other SMTP connection and health probe for as
+        # long as the lock is held, defeating the whole point of the
+        # bounded worker pools above. A small dedicated pool keeps this
+        # off the event loop without contending with resolution/forwarding
+        # for threads.
+        self._dedup_executor = ThreadPoolExecutor(
+            max_workers=4,
+            thread_name_prefix="sl-dedup",
+        )
 
     def close(self) -> None:
         self._resolver_executor.shutdown(wait=False)
         self._forward_executor.shutdown(wait=False)
+        self._dedup_executor.shutdown(wait=False)
 
     async def handle_MAIL(self, server, session, envelope, address, mail_options) -> str:
         if not _sender_allowed(self.config, address):
@@ -344,109 +359,52 @@ class SmtpProxyHandler:
                 fingerprint = _forward_fingerprint(
                     envelope.mail_from or "", transformed_recipients, transformed_message
                 )
-                try:
-                    # Atomically claim the fingerprint here, before forwarding,
-                    # rather than just checking it: a client that disconnects
-                    # during a slow upstream send and immediately retries would
-                    # otherwise have both submissions pass a read-only check
-                    # before either one records success, and both would forward.
-                    reservation = self._dedup_cache.try_reserve_forwarding(
-                        fingerprint,
-                        correlation_id,
-                        self.config.duplicate_suppression_window_seconds,
-                        self.config.duplicate_reservation_lease_seconds,
-                        self.config.duplicate_reservation_abandoned_grace_seconds,
-                    )
-                except Exception:
-                    # Duplicate suppression is a best-effort safety net, not
-                    # a delivery gate: a local cache/disk problem must not
-                    # block legitimate mail. Fail open here and still try
-                    # to forward normally.
-                    LOGGER.exception("Duplicate-submission cache lookup failed; forwarding anyway")
-                    reservation = ReservationResult(outcome="claimed")
 
-                if reservation.outcome == "completed":
-                    # The upstream SMTP server already accepted this exact
-                    # message within the suppression window. Report the
-                    # already-known success rather than forwarding (and
-                    # therefore delivering) it a second time.
-                    LOGGER.info(
-                        "audit %s",
-                        audit_event(
-                            "smtp_duplicate_already_delivered",
-                            peer=peer,
-                            correlation_id=correlation_id,
-                            policy="duplicate_already_delivered",
-                            prior_correlation_id=reservation.prior_attempt_id or "unknown",
-                            recipient_count=len(transformed_recipients),
-                        ),
-                    )
-                    return "250 Message already accepted for delivery"
-
-                if reservation.outcome in ("in_flight", "abandoned"):
-                    # A matching submission is either genuinely still being
-                    # forwarded ("in_flight") or its reservation lease
-                    # expired without being resolved, most likely because
-                    # the proxy process was killed mid-send ("abandoned").
-                    # Neither case tells us the original message was never
-                    # delivered, so forwarding this one now could create a
-                    # duplicate. Defer with a temporary response instead of
-                    # a permanent one: a legitimate client should retry
-                    # later rather than treat this as a hard bounce.
-                    LOGGER.info(
-                        "audit %s",
-                        audit_event(
-                            "smtp_message_deferred",
-                            peer=peer,
-                            correlation_id=correlation_id,
-                            policy=(
-                                "duplicate_in_flight"
-                                if reservation.outcome == "in_flight"
-                                else "duplicate_reservation_abandoned"
-                            ),
-                            prior_correlation_id=reservation.prior_attempt_id or "unknown",
-                            reservation_age_ms=(
-                                int(reservation.age_seconds * 1000)
-                                if reservation.age_seconds is not None
-                                else None
-                            ),
-                            recipient_count=len(transformed_recipients),
-                        ),
-                    )
-                    return (
-                        "451 A matching submission is already being processed or its "
-                        "delivery outcome is not yet confirmed; please retry shortly"
-                    )
-
-            # Forwarding runs as an independent, shielded task: if the
-            # client disconnects while this is in flight, handle_DATA's
-            # own await is cancelled (as it must be, so the connection
-            # teardown proceeds normally), but the forwarding task keeps
-            # running to completion and always logs its real outcome --
-            # an upstream send already accepted by Proton Bridge is never
-            # silently dropped on the floor just because nobody is left
-            # to read the SMTP response.
+            # From here on, claiming the duplicate-reservation and (if
+            # claimed) actually forwarding run as a single independent,
+            # shielded task: if the client disconnects while this is in
+            # flight, handle_DATA's own await is cancelled (as it must be,
+            # so the connection teardown proceeds normally), but the task
+            # keeps running to completion and always logs its real
+            # outcome. This must cover the reservation claim too, not just
+            # the network forward: claiming it is itself an off-event-loop
+            # write (see _dedup_executor below), so without this, a
+            # disconnect landing in that narrow window could leave a
+            # 'pending' reservation that nothing would ever resolve, and a
+            # message that was never forwarded and never retried until its
+            # lease and abandoned-grace period both elapsed. An upstream
+            # send already accepted by Proton Bridge is, as before, never
+            # silently dropped on the floor just because nobody is left to
+            # read the SMTP response.
             phase = "forwarding"
             forward_started = time.monotonic()
-            forward_task = asyncio.ensure_future(
-                self._forward_and_record(
+            outcome_task = asyncio.ensure_future(
+                self._claim_duplicate_and_forward(
                     correlation_id=correlation_id,
                     peer=peer,
+                    fingerprint=fingerprint,
                     sender=envelope.mail_from or "",
                     recipients=transformed_recipients,
                     message=transformed_message,
-                    fingerprint=fingerprint,
                     started=forward_started,
                 )
             )
-            forward_task.add_done_callback(_swallow_task_exception)
+            outcome_task.add_done_callback(_swallow_task_exception)
             try:
-                await asyncio.shield(forward_task)
+                return await asyncio.shield(outcome_task)
             except UpstreamForwardingError as exc:
+                if exc.ambiguous_delivery:
+                    # The connection to upstream was lost or timed out
+                    # while the message was already being transmitted: it
+                    # may have been accepted despite this error. Do not
+                    # tell the client it was definitively rejected.
+                    return (
+                        "451 Upstream SMTP connection lost before a delivery confirmation "
+                        "was received; please retry"
+                    )
                 return f"550 {exc.public_message}"
             except Exception:
                 return "451 SimpleLogin SMTP proxy internal error while forwarding"
-            return "250 Message accepted for delivery"
         except asyncio.CancelledError:
             LOGGER.info(
                 "audit %s",
@@ -470,6 +428,118 @@ class SmtpProxyHandler:
             + self.config.duplicate_reservation_abandoned_grace_seconds,
         )
 
+    async def _claim_duplicate_and_forward(
+        self,
+        correlation_id: str,
+        peer: str,
+        fingerprint: Optional[str],
+        sender: str,
+        recipients,
+        message: Message,
+        started: float,
+    ) -> str:
+        """Claim the duplicate-suppression reservation, if enabled, and
+        dispatch to actual forwarding if and only if it was claimed.
+
+        Called as a single shielded task from handle_DATA so that a
+        client disconnect can never land in between "reservation claimed"
+        and "forwarding started" -- see the comment at that call site.
+        """
+        if fingerprint:
+            loop = asyncio.get_running_loop()
+            try:
+                # Atomically claim the fingerprint here, before forwarding,
+                # rather than just checking it: a client that disconnects
+                # during a slow upstream send and immediately retries would
+                # otherwise have both submissions pass a read-only check
+                # before either one records success, and both would forward.
+                # Run on the dedup executor, not the event loop directly:
+                # if the SQLite file is locked by a concurrent writer, this
+                # write can block for up to SQLite's busy timeout, which
+                # must never stall other connections/health checks.
+                reservation = await loop.run_in_executor(
+                    self._dedup_executor,
+                    functools.partial(
+                        self._dedup_cache.try_reserve_forwarding,
+                        fingerprint,
+                        correlation_id,
+                        self.config.duplicate_suppression_window_seconds,
+                        self.config.duplicate_reservation_lease_seconds,
+                        self.config.duplicate_reservation_abandoned_grace_seconds,
+                    ),
+                )
+            except Exception:
+                # Duplicate suppression is a best-effort safety net, not a
+                # delivery gate: a local cache/disk problem must not block
+                # legitimate mail. Fail open here and still try to forward
+                # normally.
+                LOGGER.exception("Duplicate-submission cache lookup failed; forwarding anyway")
+                reservation = ReservationResult(outcome="claimed")
+
+            if reservation.outcome == "completed":
+                # The upstream SMTP server already accepted this exact
+                # message within the suppression window. Report the
+                # already-known success rather than forwarding (and
+                # therefore delivering) it a second time.
+                LOGGER.info(
+                    "audit %s",
+                    audit_event(
+                        "smtp_duplicate_already_delivered",
+                        peer=peer,
+                        correlation_id=correlation_id,
+                        policy="duplicate_already_delivered",
+                        prior_correlation_id=reservation.prior_attempt_id or "unknown",
+                        recipient_count=len(recipients),
+                    ),
+                )
+                return "250 Message already accepted for delivery"
+
+            if reservation.outcome in ("in_flight", "abandoned"):
+                # A matching submission is either genuinely still being
+                # forwarded ("in_flight") or its reservation lease expired
+                # without being resolved, most likely because the proxy
+                # process was killed mid-send ("abandoned"). Neither case
+                # tells us the original message was never delivered, so
+                # forwarding this one now could create a duplicate. Defer
+                # with a temporary response instead of a permanent one: a
+                # legitimate client should retry later rather than treat
+                # this as a hard bounce.
+                LOGGER.info(
+                    "audit %s",
+                    audit_event(
+                        "smtp_message_deferred",
+                        peer=peer,
+                        correlation_id=correlation_id,
+                        policy=(
+                            "duplicate_in_flight"
+                            if reservation.outcome == "in_flight"
+                            else "duplicate_reservation_abandoned"
+                        ),
+                        prior_correlation_id=reservation.prior_attempt_id or "unknown",
+                        reservation_age_ms=(
+                            int(reservation.age_seconds * 1000)
+                            if reservation.age_seconds is not None
+                            else None
+                        ),
+                        recipient_count=len(recipients),
+                    ),
+                )
+                return (
+                    "451 A matching submission is already being processed or its "
+                    "delivery outcome is not yet confirmed; please retry shortly"
+                )
+
+        await self._forward_and_record(
+            correlation_id=correlation_id,
+            peer=peer,
+            sender=sender,
+            recipients=recipients,
+            message=message,
+            fingerprint=fingerprint,
+            started=started,
+        )
+        return "250 Message accepted for delivery"
+
     async def _renew_reservation_periodically(self, fingerprint: str, attempt_id: str) -> None:
         """Keep a pending reservation's lease alive while genuinely in
         progress, so a slow-but-alive forward is never mistaken for an
@@ -478,11 +548,19 @@ class SmtpProxyHandler:
         started it, win or lose.
         """
         interval_seconds = max(0.1, self.config.duplicate_reservation_lease_seconds / 3)
+        loop = asyncio.get_running_loop()
         try:
             while True:
                 await asyncio.sleep(interval_seconds)
                 try:
-                    self._dedup_cache.renew_reservation(fingerprint, attempt_id)
+                    # Off the event loop, like every other dedup cache
+                    # write -- see the comment on _dedup_executor.
+                    await loop.run_in_executor(
+                        self._dedup_executor,
+                        self._dedup_cache.renew_reservation,
+                        fingerprint,
+                        attempt_id,
+                    )
                 except Exception:
                     LOGGER.exception("Failed to renew duplicate-suppression reservation lease")
         except asyncio.CancelledError:
@@ -514,28 +592,37 @@ class SmtpProxyHandler:
             )
         except Exception as exc:
             forward_duration_ms = int((time.monotonic() - started) * 1000)
-            if fingerprint and isinstance(exc, UpstreamForwardingError):
-                # A confirmed failure: nothing was delivered, so the
-                # fingerprint is immediately eligible for a legitimate
-                # retry to reclaim (see try_reserve_forwarding).
+            # A confirmed failure is a definitive UpstreamForwardingError
+            # raised before any message bytes were sent, or in response to
+            # an explicit rejection reply -- nothing was delivered, so the
+            # fingerprint is immediately eligible for a legitimate retry
+            # to reclaim (see try_reserve_forwarding). Everything else --
+            # an unexpected exception, or an UpstreamForwardingError
+            # flagged ambiguous_delivery (the connection was lost or timed
+            # out while the message bytes were already being transmitted,
+            # so the upstream may have already accepted it) -- is treated
+            # as outcome-unknown: deliberately leave the reservation
+            # 'pending' rather than guess. A later resubmission's
+            # try_reserve_forwarding call will see it as in-flight, then
+            # abandoned once its lease expires, and only reclaim it
+            # (accepting the documented residual duplicate risk) after the
+            # abandoned-reservation grace period.
+            confirmed_failure = isinstance(exc, UpstreamForwardingError) and not exc.ambiguous_delivery
+            if fingerprint and confirmed_failure:
                 try:
-                    self._dedup_cache.mark_failed(
-                        fingerprint,
-                        correlation_id,
-                        prune_older_than_seconds=self._dedup_prune_window_seconds(),
+                    await loop.run_in_executor(
+                        self._dedup_executor,
+                        functools.partial(
+                            self._dedup_cache.mark_failed,
+                            fingerprint,
+                            correlation_id,
+                            prune_older_than_seconds=self._dedup_prune_window_seconds(),
+                        ),
                     )
                 except Exception:
                     LOGGER.exception("Failed to record forwarded-message dedup failure")
-            # else (fingerprint set but exc is not UpstreamForwardingError):
-            # the outcome is genuinely unknown -- this is not a confirmed
-            # failure, and forward() may have already handed the message
-            # to the upstream server before raising. Deliberately leave
-            # the reservation 'pending' rather than guess: a later
-            # resubmission's try_reserve_forwarding call will see it as
-            # in-flight, then abandoned once its lease expires, and only
-            # reclaim it (accepting the documented residual duplicate
-            # risk) after the abandoned-reservation grace period.
-            if isinstance(exc, UpstreamForwardingError):
+
+            if confirmed_failure:
                 LOGGER.info(
                     "audit %s",
                     audit_event(
@@ -550,14 +637,19 @@ class SmtpProxyHandler:
                 )
             else:
                 # Every forwarding attempt must have an observable terminal
-                # outcome, including unexpected failures: an exception here
-                # must not disappear silently just because the submitting
-                # client already disconnected and nobody is left to read
-                # handle_DATA's return value. error_type/error_category are
-                # structured and sanitized (see safe_forwarding_error_fields)
-                # specifically so this can never leak recipient addresses,
-                # message content, or credentials embedded in exc's own
-                # message text.
+                # outcome, including unexpected or ambiguous failures: an
+                # exception here must not disappear silently just because
+                # the submitting client already disconnected and nobody is
+                # left to read handle_DATA's return value.
+                # error_type/error_category are structured and sanitized
+                # (see safe_forwarding_error_fields) specifically so this
+                # can never leak recipient addresses, message content, or
+                # credentials embedded in exc's own message text. For an
+                # ambiguous UpstreamForwardingError, classify the original
+                # smtplib/OSError cause rather than the generic wrapper, so
+                # the audit event still reports something specific like
+                # "server_disconnected" instead of "unexpected".
+                error_source = exc.__cause__ if isinstance(exc, UpstreamForwardingError) else exc
                 LOGGER.info(
                     "audit %s",
                     audit_event(
@@ -567,7 +659,7 @@ class SmtpProxyHandler:
                         policy="internal_error",
                         recipient_count=len(recipients),
                         forward_duration_ms=forward_duration_ms,
-                        **safe_forwarding_error_fields(exc),
+                        **safe_forwarding_error_fields(error_source or exc),
                     ),
                 )
             raise
@@ -581,10 +673,14 @@ class SmtpProxyHandler:
 
         if fingerprint:
             try:
-                self._dedup_cache.mark_forwarded(
-                    fingerprint,
-                    correlation_id,
-                    prune_older_than_seconds=self._dedup_prune_window_seconds(),
+                await loop.run_in_executor(
+                    self._dedup_executor,
+                    functools.partial(
+                        self._dedup_cache.mark_forwarded,
+                        fingerprint,
+                        correlation_id,
+                        prune_older_than_seconds=self._dedup_prune_window_seconds(),
+                    ),
                 )
             except Exception:
                 LOGGER.exception("Failed to record forwarded-message dedup fingerprint")
