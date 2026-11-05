@@ -266,6 +266,60 @@ class MessageTransformTests(unittest.TestCase):
         self.assertEqual(transformed.get("To"), "reply+existing@simplelogin.co")
         self.assertEqual(transformed_envelope_recipients(plan), ["reply+existing@simplelogin.co"])
 
+    def test_bulk_prefetch_is_skipped_when_direct_external_send_is_allowed(self):
+        # Regression for Codex's finding: when allow_direct_external_send
+        # is True, alias_routing_core's planner keeps every
+        # EXTERNAL_RECIPIENT address unchanged and never calls the
+        # reverse-alias resolver for it at all. The bulk prefetch must
+        # likewise skip resolve_bulk() in this mode -- calling it anyway
+        # would still list the alias's SimpleLogin contacts and create a
+        # reverse-alias contact for each external recipient, even though
+        # nothing in the actual plan will ever use it.
+        class TrackingResolver:
+            def __init__(self):
+                self.bulk_calls = 0
+                self.per_recipient_calls = 0
+
+            def resolve_bulk(self, recipients, selected_alias, request_stats=None):
+                self.bulk_calls += 1
+                from sl_smtp_proxy.reverse_alias_resolver import ResolutionStats
+
+                return ResolutionStats()
+
+            def __call__(self, original, alias):
+                self.per_recipient_calls += 1
+                return f"reply+{original.split('@', 1)[0]}@simplelogin.co"
+
+        resolver = TrackingResolver()
+        msg = EmailMessage()
+        msg["From"] = "sender@example.com"
+        msg["To"] = "external@example.net"
+        msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+        msg.set_content("hello")
+
+        cfg = SmtpProxyConfig(
+            require_auth=False,
+            manual_simplelogin_aliases={"shopping@example.com"},
+            allow_direct_external_send=True,
+        )
+        _, plan = build_plan_for_message(
+            "sender@example.com",
+            ["external@example.net", "shopping@example.com"],
+            msg.as_bytes(),
+            cfg,
+            reverse_alias_resolver=resolver,
+        )
+
+        self.assertEqual(resolver.bulk_calls, 0)
+        self.assertEqual(resolver.per_recipient_calls, 0)
+        # Confirm the external recipient really was kept unchanged (not
+        # rewritten/rejected), matching allow_direct_external_send's
+        # documented behavior -- otherwise this test would not actually
+        # be exercising the scenario the prefetch needs to skip.
+        kept = [item for item in plan.actions if item.original == "external@example.net"]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].action, TransformAction.KEEP)
+
 
 if __name__ == "__main__":
     unittest.main()

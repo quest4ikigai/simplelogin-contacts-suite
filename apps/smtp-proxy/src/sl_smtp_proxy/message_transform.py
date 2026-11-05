@@ -113,6 +113,16 @@ def _prefetch_reverse_alias_contacts(
     if resolve_bulk is None:
         return
 
+    if config.allow_direct_external_send:
+        # When direct external delivery is allowed, build_transform_plan's
+        # planner keeps every EXTERNAL_RECIPIENT address unchanged and
+        # never calls the reverse-alias resolver for it at all (see
+        # alias_routing_core.planner). Prefetching here would still list
+        # the alias's contacts and create a SimpleLogin reverse-alias
+        # contact for each external recipient, even though nothing will
+        # ever use it: wasted API calls and persistent, unwanted contacts.
+        return
+
     context = config.routing_context(extra_simplelogin_aliases=extra_simplelogin_aliases)
     selected_alias, _source, selection_error = select_simplelogin_alias_with_source(
         alias_selectors,

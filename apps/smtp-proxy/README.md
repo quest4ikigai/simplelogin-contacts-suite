@@ -91,7 +91,11 @@ every recipient against that single result (falling back automatically, per
 recipient, to the original slower path if the bulk pre-fetch fails for any
 reason). A 40-50 recipient classroom-style send therefore costs one contact
 list fetch plus one contact-creation call per genuinely new recipient, not one
-contact list fetch per recipient.
+contact list fetch per recipient. This prefetch is skipped entirely when
+`ALLOW_DIRECT_EXTERNAL_SEND=true`: in that mode the planner keeps external
+recipients unchanged and never calls the reverse-alias resolver for them,
+so prefetching would only cost extra SimpleLogin API calls and create
+reverse-alias contacts that nothing ever uses.
 
 Relevant settings:
 
