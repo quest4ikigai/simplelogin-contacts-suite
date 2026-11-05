@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -10,6 +11,24 @@ from .models import Alias, AliasContact, normalized_email
 
 
 PAGE_SIZE_ASSUMPTION = 20
+
+
+class RequestStats:
+    """Accumulates SimpleLogin API call counts and cumulative duration.
+
+    Intended to be created fresh per logical operation (e.g. one SMTP
+    submission) and passed into client calls so callers can log how much
+    API traffic a single operation generated, without the client itself
+    needing to know anything about the caller's logging.
+    """
+
+    def __init__(self) -> None:
+        self.request_count = 0
+        self.total_duration_seconds = 0.0
+
+    def record(self, duration_seconds: float) -> None:
+        self.request_count += 1
+        self.total_duration_seconds += duration_seconds
 
 
 class SimpleLoginClient:
@@ -41,8 +60,10 @@ class SimpleLoginClient:
         path: str,
         params: Optional[Dict[str, Any]] = None,
         json: Optional[Dict[str, Any]] = None,
+        stats: Optional[RequestStats] = None,
     ) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"
+        started = time.monotonic()
         try:
             response = self.session.request(
                 method,
@@ -52,8 +73,13 @@ class SimpleLoginClient:
                 timeout=self.timeout_seconds,
             )
         except requests.RequestException as exc:
+            if stats is not None:
+                stats.record(time.monotonic() - started)
             message = redact_values(str(exc), [self.api_key])
             raise SimpleLoginApiError(f"SimpleLogin API request failed: {message}") from exc
+
+        if stats is not None:
+            stats.record(time.monotonic() - started)
 
         if response.status_code >= 400:
             body = redact_values(response.text[:500], [self.api_key])
@@ -67,11 +93,11 @@ class SimpleLoginClient:
         except ValueError as exc:
             raise SimpleLoginApiError("SimpleLogin API returned invalid JSON") from exc
 
-    def list_aliases(self) -> List[Alias]:
+    def list_aliases(self, stats: Optional[RequestStats] = None) -> List[Alias]:
         aliases: List[Alias] = []
         page = 0
         while True:
-            data = self._request("GET", "/api/v2/aliases", params={"page_id": page})
+            data = self._request("GET", "/api/v2/aliases", params={"page_id": page}, stats=stats)
             batch = data.get("aliases", [])
             aliases.extend(Alias.from_api(item) for item in batch)
             if len(batch) < PAGE_SIZE_ASSUMPTION:
@@ -79,11 +105,16 @@ class SimpleLoginClient:
             page += 1
         return aliases
 
-    def list_contacts(self, alias_id: str) -> List[AliasContact]:
+    def list_contacts(self, alias_id: str, stats: Optional[RequestStats] = None) -> List[AliasContact]:
         contacts: List[AliasContact] = []
         page = 0
         while True:
-            data = self._request("GET", f"/api/aliases/{alias_id}/contacts", params={"page_id": page})
+            data = self._request(
+                "GET",
+                f"/api/aliases/{alias_id}/contacts",
+                params={"page_id": page},
+                stats=stats,
+            )
             batch = data.get("contacts", [])
             contacts.extend(AliasContact.from_api(item, alias_id=str(alias_id)) for item in batch)
             if len(batch) < PAGE_SIZE_ASSUMPTION:
@@ -91,21 +122,32 @@ class SimpleLoginClient:
             page += 1
         return contacts
 
-    def create_contact(self, alias_id: str, contact: str) -> AliasContact:
+    def create_contact(
+        self,
+        alias_id: str,
+        contact: str,
+        stats: Optional[RequestStats] = None,
+    ) -> AliasContact:
         data = self._request(
             "POST",
             f"/api/aliases/{alias_id}/contacts",
             json={"contact": contact},
+            stats=stats,
         )
         payload = data.get("contact") if isinstance(data.get("contact"), dict) else data
         return AliasContact.from_api(payload, alias_id=str(alias_id))
 
-    def get_or_create_contact(self, alias_id: str, contact: str) -> AliasContact:
+    def get_or_create_contact(
+        self,
+        alias_id: str,
+        contact: str,
+        stats: Optional[RequestStats] = None,
+    ) -> AliasContact:
         wanted = normalized_email(contact)
-        for existing in self.list_contacts(alias_id):
+        for existing in self.list_contacts(alias_id, stats=stats):
             if normalized_email(existing.contact) == wanted:
                 return existing
-        return self.create_contact(alias_id, contact)
+        return self.create_contact(alias_id, contact, stats=stats)
 
 
 def client_from_env() -> SimpleLoginClient:

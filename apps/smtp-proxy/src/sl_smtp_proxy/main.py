@@ -10,7 +10,7 @@ from .smtp_server import SmtpProxyServer
 
 async def main() -> None:
     config = load_config_from_env()
-    configure_logging(config.log_level)
+    configure_logging(config.log_level, config.aiosmtpd_log_level)
     server = SmtpProxyServer(config)
     await server.start()
     logging.getLogger(__name__).info(

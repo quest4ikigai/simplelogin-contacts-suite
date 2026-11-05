@@ -101,7 +101,14 @@ class SmtpProxyConfig:
     cache_alias_ttl_seconds: int = 3600
     cache_contact_ttl_seconds: int = 86400
 
+    resolver_max_workers: int = 4
+    forward_max_workers: int = 4
+    duplicate_suppression_window_seconds: int = 86400
+    duplicate_reservation_lease_seconds: int = 60
+    duplicate_reservation_abandoned_grace_seconds: int = 300
+
     log_level: str = "INFO"
+    aiosmtpd_log_level: str = "WARNING"
     log_redact_addresses: bool = True
     log_message_body: bool = False
     log_subject: bool = False
@@ -165,7 +172,19 @@ def load_config_from_env() -> SmtpProxyConfig:
         cache_path=os.environ.get("CACHE_PATH", "/data/cache.sqlite3"),
         cache_alias_ttl_seconds=env_int("CACHE_ALIAS_TTL_SECONDS", 3600),
         cache_contact_ttl_seconds=env_int("CACHE_CONTACT_TTL_SECONDS", 86400),
+        resolver_max_workers=env_int("SMTP_PROXY_RESOLVER_MAX_WORKERS", 4),
+        forward_max_workers=env_int("SMTP_PROXY_FORWARD_MAX_WORKERS", 4),
+        duplicate_suppression_window_seconds=env_int(
+            "SMTP_PROXY_DUPLICATE_SUPPRESSION_WINDOW_SECONDS", 86400
+        ),
+        duplicate_reservation_lease_seconds=env_int(
+            "SMTP_PROXY_DUPLICATE_RESERVATION_LEASE_SECONDS", 60
+        ),
+        duplicate_reservation_abandoned_grace_seconds=env_int(
+            "SMTP_PROXY_DUPLICATE_RESERVATION_ABANDONED_GRACE_SECONDS", 300
+        ),
         log_level=os.environ.get("LOG_LEVEL", "INFO"),
+        aiosmtpd_log_level=os.environ.get("SMTP_PROXY_AIOSMTPD_LOG_LEVEL", "WARNING"),
         log_redact_addresses=env_bool("LOG_REDACT_ADDRESSES", True),
         log_message_body=env_bool("LOG_MESSAGE_BODY", False),
         log_subject=env_bool("LOG_SUBJECT", False),

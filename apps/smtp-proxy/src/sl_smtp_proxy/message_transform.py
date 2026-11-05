@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from email import policy
 from email.message import EmailMessage, Message
@@ -8,13 +9,21 @@ from email.utils import formataddr, getaddresses
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 from alias_routing_core import (
+    RecipientClassification,
     TransformAction,
     TransformPlan,
     build_transform_plan,
+    classify_address,
     normalize_email_address,
+    select_simplelogin_alias_with_source,
 )
+from simplelogin_client import RequestStats
 
 from .config import SmtpProxyConfig
+from .reverse_alias_resolver import ResolutionStats
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 CONTROL_HEADER_PREFIX = "x-simplelogin-"
@@ -89,6 +98,64 @@ def collect_cover_recipient_candidates(message: Message, envelope_recipients: It
     return to_addresses
 
 
+def _prefetch_reverse_alias_contacts(
+    recipients: List[str],
+    alias_selectors: List[str],
+    cover_recipient_candidates: List[str],
+    header_alias: Optional[str],
+    config: SmtpProxyConfig,
+    reverse_alias_resolver,
+    extra_simplelogin_aliases: Optional[Iterable[str]],
+    request_stats: Optional[RequestStats],
+    resolution_stats: Optional[ResolutionStats],
+) -> None:
+    resolve_bulk = getattr(reverse_alias_resolver, "resolve_bulk", None)
+    if resolve_bulk is None:
+        return
+
+    if config.allow_direct_external_send:
+        # When direct external delivery is allowed, build_transform_plan's
+        # planner keeps every EXTERNAL_RECIPIENT address unchanged and
+        # never calls the reverse-alias resolver for it at all (see
+        # alias_routing_core.planner). Prefetching here would still list
+        # the alias's contacts and create a SimpleLogin reverse-alias
+        # contact for each external recipient, even though nothing will
+        # ever use it: wasted API calls and persistent, unwanted contacts.
+        return
+
+    context = config.routing_context(extra_simplelogin_aliases=extra_simplelogin_aliases)
+    selected_alias, _source, selection_error = select_simplelogin_alias_with_source(
+        alias_selectors,
+        context,
+        header_alias=header_alias,
+        cover_recipient_candidates=cover_recipient_candidates,
+        alias_candidate_recipients=recipients,
+    )
+    if selection_error or not selected_alias:
+        return
+
+    external_recipients = [
+        recipient
+        for recipient in recipients
+        if classify_address(recipient, context)[0] == RecipientClassification.EXTERNAL_RECIPIENT
+    ]
+    if not external_recipients:
+        return
+
+    try:
+        result = resolve_bulk(external_recipients, selected_alias, request_stats=request_stats)
+    except Exception:  # pragma: no cover - best-effort prefetch only
+        LOGGER.debug("Bulk reverse-alias prefetch failed; falling back to per-recipient resolution", exc_info=True)
+        return
+
+    if resolution_stats is not None and result is not None:
+        resolution_stats.cache_hits = result.cache_hits
+        resolution_stats.cache_misses = result.cache_misses
+        resolution_stats.contacts_found = result.contacts_found
+        resolution_stats.contacts_created = result.contacts_created
+        resolution_stats.list_contacts_calls = result.list_contacts_calls
+
+
 def build_plan_for_message(
     envelope_sender: str,
     envelope_recipients: Iterable[str],
@@ -96,16 +163,32 @@ def build_plan_for_message(
     config: SmtpProxyConfig,
     reverse_alias_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
     extra_simplelogin_aliases: Optional[Iterable[str]] = None,
+    request_stats: Optional[RequestStats] = None,
+    resolution_stats: Optional[ResolutionStats] = None,
 ) -> Tuple[Message, TransformPlan]:
     message = parse_message(data)
     envelope_recipient_list = list(envelope_recipients)
     recipients = collect_recipients(message, envelope_recipient_list)
     alias_selectors = collect_alias_selector_recipients(message, envelope_recipient_list)
     cover_recipient_candidates = collect_cover_recipient_candidates(message, envelope_recipient_list)
+    header_alias = message.get("X-SimpleLogin-Alias")
+
+    _prefetch_reverse_alias_contacts(
+        recipients,
+        alias_selectors,
+        cover_recipient_candidates,
+        header_alias,
+        config,
+        reverse_alias_resolver,
+        extra_simplelogin_aliases,
+        request_stats,
+        resolution_stats,
+    )
+
     plan = build_transform_plan(
         recipients,
         config.routing_context(extra_simplelogin_aliases=extra_simplelogin_aliases),
-        header_alias=message.get("X-SimpleLogin-Alias"),
+        header_alias=header_alias,
         alias_selector_recipients=alias_selectors,
         cover_recipient_candidates=cover_recipient_candidates,
         reverse_alias_resolver=reverse_alias_resolver,
