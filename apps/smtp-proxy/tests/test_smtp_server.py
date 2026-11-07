@@ -1312,6 +1312,66 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             await proxy.stop()
             upstream.stop(no_assert=True)
 
+    async def test_restarting_a_stopped_server_can_still_forward(self):
+        # Regression for Codex's finding: stop() permanently shuts down the
+        # handler's resolver/forward/dedup thread pools, but the same
+        # handler instance is reused by a later start() (only the
+        # aiosmtpd controller is recreated). Without reopening the pools,
+        # every stage that schedules work on them -- resolution, the
+        # upstream forward, and the dedup reservation -- raises
+        # "RuntimeError: cannot schedule new futures after shutdown" on
+        # the first message after a restart.
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+                alias_suffix_domains={"@example.net"},
+            ),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+        )
+        await proxy.start()
+        await proxy.stop()
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "Alice <alice@example.com>"
+            msg["Bcc"] = "orders@example.net"
+            msg["X-SimpleLogin-Alias"] = "orders@example.net"
+            msg.set_content("hello after restart")
+
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                submit_message,
+                proxy.port,
+                msg,
+                ["alice@example.com", "orders@example.net"],
+            )
+
+            self.assertEqual(result[0], 250)
+            self.assertEqual(len(upstream_handler.messages), 1)
+            self.assertEqual(
+                upstream_handler.messages[0]["rcpt_tos"],
+                ["reply+alice@simplelogin.co"],
+            )
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
     async def test_post_transform_verifier_rejects_unsafe_transform_before_upstream(self):
         upstream_handler = CaptureUpstreamHandler()
         upstream_port = free_port()

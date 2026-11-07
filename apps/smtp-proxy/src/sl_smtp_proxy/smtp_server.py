@@ -136,15 +136,18 @@ class SmtpProxyHandler:
         )
         self.forwarder = forwarder or UpstreamSmtpForwarder(config)
         self._dedup_cache = SQLiteAliasCache(config.cache_path)
+        self._open_executors()
+
+    def _open_executors(self) -> None:
         # Separate bounded pools for resolution (SimpleLogin API/cache work)
         # and forwarding (upstream SMTP) so a burst of large messages can't
         # spawn unbounded threads, and so one stage can't starve the other.
         self._resolver_executor = ThreadPoolExecutor(
-            max_workers=max(1, config.resolver_max_workers),
+            max_workers=max(1, self.config.resolver_max_workers),
             thread_name_prefix="sl-resolver",
         )
         self._forward_executor = ThreadPoolExecutor(
-            max_workers=max(1, config.forward_max_workers),
+            max_workers=max(1, self.config.forward_max_workers),
             thread_name_prefix="sl-forward",
         )
         # The duplicate-suppression cache does synchronous SQLite writes
@@ -161,11 +164,24 @@ class SmtpProxyHandler:
             max_workers=4,
             thread_name_prefix="sl-dedup",
         )
+        self._closed = False
+
+    def reopen(self) -> None:
+        """Recreate the worker pools if a previous close() shut them down.
+
+        SmtpProxyServer.stop() calls close() but keeps the same handler
+        instance, so a subsequent start() must be able to hand it fresh,
+        usable executors rather than leaving handle_DATA to schedule work
+        on pools that were already shut down.
+        """
+        if self._closed:
+            self._open_executors()
 
     def close(self) -> None:
         self._resolver_executor.shutdown(wait=False)
         self._forward_executor.shutdown(wait=False)
         self._dedup_executor.shutdown(wait=False)
+        self._closed = True
 
     async def handle_MAIL(self, server, session, envelope, address, mail_options) -> str:
         if not _sender_allowed(self.config, address):
@@ -735,6 +751,7 @@ class SmtpProxyServer:
 
     async def start(self) -> None:
         validate_startup_config(self.config)
+        self.handler.reopen()
         controller_ssl_context, smtp_tls_context, require_starttls, auth_require_tls = (
             _tls_settings(self.config)
         )
