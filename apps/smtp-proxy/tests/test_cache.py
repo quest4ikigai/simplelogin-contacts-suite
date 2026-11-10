@@ -217,6 +217,32 @@ class ForwardedMessageDedupTests(unittest.TestCase):
         self.assertEqual(result.outcome, "partial")
         self.assertEqual(result.prior_attempt_id, "attempt-1")
 
+    def test_mark_partial_persists_detail_for_later_operator_recovery(self):
+        # Regression for Codex's finding: a DEBUG-only log line at the
+        # moment of the partial refusal is not a durable recovery
+        # mechanism -- it is lost forever if DEBUG logging was not
+        # already enabled, and the permanent "partial" dedup state
+        # means the submission can never be replayed later to
+        # reproduce it. The refused-recipient detail must be persisted
+        # on the row itself so an operator can recover it afterward
+        # regardless of what the log level happened to be at the time.
+        self._reserve("fp-1", "attempt-1")
+        self.cache.mark_partial(
+            "fp-1",
+            "attempt-1",
+            prune_older_than_seconds=3600,
+            detail='{"refused_recipients": ["reply+bob@simplelogin.co"], "refused_smtp_codes": [550]}',
+        )
+
+        with self.cache.connect() as conn:
+            row = conn.execute(
+                "SELECT detail FROM forwarded_messages WHERE fingerprint = ?", ("fp-1",)
+            ).fetchone()
+        self.assertEqual(
+            row[0],
+            '{"refused_recipients": ["reply+bob@simplelogin.co"], "refused_smtp_codes": [550]}',
+        )
+
     def test_partial_delivery_entry_is_never_reclaimed_by_age(self):
         # Regression for Codex's finding: unlike "completed" (reclaimed
         # once it falls outside the suppression window) or "failed"

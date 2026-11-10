@@ -88,6 +88,7 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     for statement in (
         "ALTER TABLE forwarded_messages ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'",
         "ALTER TABLE forwarded_messages ADD COLUMN attempt_id TEXT",
+        "ALTER TABLE forwarded_messages ADD COLUMN detail TEXT",
     ):
         try:
             conn.execute(statement)
@@ -505,6 +506,7 @@ class SQLiteAliasCache:
         fingerprint: str,
         attempt_id: str,
         prune_older_than_seconds: int,
+        detail: Optional[str] = None,
     ) -> None:
         """Mark this attempt's reservation as a confirmed partial delivery.
 
@@ -516,8 +518,24 @@ class SQLiteAliasCache:
         client is entitled to retry a temporary failure indefinitely, so
         no amount of elapsed time makes it safe to let an identical
         retry redeliver to the recipients already accepted.
+
+        detail, if given, is stored verbatim on the row (callers pass a
+        bounded JSON string identifying the refused recipients and SMTP
+        codes). Because this fingerprint can never be forwarded again --
+        there is no way to replay the submission later to reproduce
+        this information -- this is the only durable record of which
+        recipient needs the documented manual resend, so it must be
+        captured here rather than relying on logging being at the right
+        level at the time. It is never written to any log stream; an
+        operator retrieves it by reading this table directly (e.g.
+        `sqlite3 cache.sqlite3 "SELECT fingerprint, detail FROM
+        forwarded_messages WHERE status = 'partial'"`), the same local
+        trust boundary the "contacts" table's plaintext email addresses
+        already rely on.
         """
-        self._resolve_reservation(fingerprint, attempt_id, "partial", prune_older_than_seconds)
+        self._resolve_reservation(
+            fingerprint, attempt_id, "partial", prune_older_than_seconds, detail=detail
+        )
 
     def _resolve_reservation(
         self,
@@ -525,6 +543,7 @@ class SQLiteAliasCache:
         attempt_id: str,
         status: str,
         prune_older_than_seconds: int,
+        detail: Optional[str] = None,
     ) -> None:
         now_dt = datetime.now(timezone.utc)
         cutoff = (now_dt - timedelta(seconds=prune_older_than_seconds)).isoformat()
@@ -545,8 +564,8 @@ class SQLiteAliasCache:
             conn.execute(
                 """
                 UPDATE forwarded_messages
-                SET forwarded_at = ?, status = ?
+                SET forwarded_at = ?, status = ?, detail = ?
                 WHERE fingerprint = ? AND attempt_id = ?
                 """,
-                (now_dt.isoformat(), status, fingerprint, attempt_id),
+                (now_dt.isoformat(), status, detail, fingerprint, attempt_id),
             )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
+import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -764,6 +765,20 @@ class SmtpProxyHandler:
             # must never become eligible for an automatic full resend,
             # exactly like a completed send.
             if fingerprint:
+                # Persisted on the row itself, never logged: this is the
+                # only durable record of which recipient needs the
+                # documented manual resend, since the permanent
+                # "partial" dedup state means this exact submission can
+                # never be replayed later to reproduce it, and a DEBUG
+                # log line (see forwarder.py) only exists if an operator
+                # happened to already be watching at this exact moment.
+                detail = json.dumps(
+                    {
+                        "refused_recipients": list(result.refused_recipients),
+                        "refused_smtp_codes": list(result.refused_smtp_codes),
+                    },
+                    sort_keys=True,
+                )
                 try:
                     await loop.run_in_executor(
                         self._dedup_executor,
@@ -772,6 +787,7 @@ class SmtpProxyHandler:
                             fingerprint,
                             correlation_id,
                             prune_older_than_seconds=self._dedup_prune_window_seconds(),
+                            detail=detail,
                         ),
                     )
                 except Exception:

@@ -51,12 +51,23 @@ class ForwardResult:
     accepted_count: int
     refused_count: int
     # Numeric SMTP codes the upstream used to refuse recipients, deduped
-    # and sorted. Never the raw response text or the refused addresses
-    # themselves, which smtplib's own refusal dict embeds -- see
+    # and sorted. Safe for the normal audit log/SMTP response: never the
+    # raw response text, which smtplib's own refusal dict embeds -- see
     # safe_forwarding_error_fields for why that's never safe to log or
-    # audit as-is. A narrowly-scoped diagnostic log of the full dict is
-    # emitted at DEBUG level in forward() below, off by default.
+    # audit as-is. A narrowly-scoped diagnostic log of the full dict
+    # (including addresses) is emitted at DEBUG level in forward()
+    # below, off by default.
     refused_smtp_codes: Tuple[int, ...] = ()
+    # The refused recipient addresses themselves (post-transform, e.g. a
+    # rewritten SimpleLogin reverse-alias address rather than the
+    # original recipient the sender typed). Never put into the normal
+    # audit log or SMTP response -- callers persist this only into the
+    # protected local dedup cache row for this fingerprint (see
+    # SQLiteAliasCache.mark_partial), which is the one place an operator
+    # can recover it later to resolve a partial delivery, since the
+    # permanent "partial" dedup state means the submission can never be
+    # replayed to reproduce this information after the fact.
+    refused_recipients: Tuple[str, ...] = ()
 
     @property
     def total_count(self) -> int:
@@ -186,17 +197,23 @@ def _build_forward_result(
     recipient_list: list, refused: Dict[str, Tuple[int, bytes]]
 ) -> ForwardResult:
     if refused:
-        # Narrowly-scoped diagnostic path: only at DEBUG (disabled by
-        # default -- see config.log_level), and only here, do refused
-        # addresses and the upstream's raw response text ever reach a
-        # log. Every other path (WARNING-level logs, audit events)
-        # carries only the counts and numeric codes below.
+        # Live-tailing convenience only: a narrowly-scoped DEBUG log
+        # (disabled by default -- see config.log_level) of the full
+        # dict, including the upstream's raw response text, which the
+        # refused_recipients field below deliberately omits. This is
+        # NOT the durable recovery path -- a log line emitted while
+        # nobody was watching is gone for good, and this app's own
+        # permanent "partial" dedup state means the submission can
+        # never be replayed later to reproduce it (see mark_partial).
+        # refused_recipients on the returned ForwardResult is what
+        # callers persist into the dedup cache row instead.
         LOGGER.debug("upstream_smtp_partial_refusal refused=%r", refused)
     refused_codes = tuple(sorted({code for code, _ in refused.values()}))
     return ForwardResult(
         accepted_count=len(recipient_list) - len(refused),
         refused_count=len(refused),
         refused_smtp_codes=refused_codes,
+        refused_recipients=tuple(sorted(refused.keys())),
     )
 
 

@@ -840,6 +840,7 @@ class UpstreamForwarderTests(unittest.TestCase):
         self.assertEqual(result.total_count, 2)
         self.assertTrue(result.is_partial)
         self.assertEqual(result.refused_smtp_codes, (550,))
+        self.assertEqual(result.refused_recipients, ("bob@example.com",))
 
     def test_all_recipients_refused_still_raises_confirmed_failure(self):
         # When *every* recipient is refused, smtplib raises
@@ -3276,6 +3277,21 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             joined_logs = "\n".join(captured.output)
             self.assertNotIn("bob@example.com", joined_logs)
             self.assertNotIn("reply+bob", joined_logs)
+
+            # Regression for Codex's finding: a DEBUG-only log line is
+            # not a durable recovery mechanism (this test runs at INFO,
+            # and the "partial" fingerprint can never be replayed to
+            # reproduce it later anyway). The refused recipient must
+            # still be recoverable afterward by reading the dedup cache
+            # row directly.
+            with sqlite3.connect(proxy.config.cache_path) as conn:
+                rows = conn.execute(
+                    "SELECT detail FROM forwarded_messages WHERE status = 'partial'"
+                ).fetchall()
+            self.assertEqual(len(rows), 1)
+            detail = json.loads(rows[0][0])
+            self.assertEqual(detail["refused_recipients"], ["reply+bob@simplelogin.co"])
+            self.assertEqual(detail["refused_smtp_codes"], [550])
         finally:
             await proxy.stop()
             upstream.stop(no_assert=True)

@@ -268,17 +268,32 @@ automatic recipient-level retries. Recipient addresses are deliberately
 never written to the normal audit log or the `550` response -- for
 addresses rewritten to a SimpleLogin reverse alias, the original sender
 could not identify the affected recipient from the raw refused address
-anyway, since that mapping is internal to the proxy and SimpleLogin. To
-identify which recipient was refused, an operator can temporarily set
-`LOG_LEVEL=DEBUG`: `forwarder.py` logs the refused recipient(s) and the
-upstream's raw rejection text at `DEBUG` only, as a narrowly-scoped
-diagnostic path that is off by default and should be turned back off
-once the affected recipient has been identified. With that in hand, the
-operator (or the original sender, for recipients they typed themselves
-and who were not rewritten to a reverse alias) can send a new,
-standalone message to just that recipient -- a fresh compose gets its
-own fingerprint and is unaffected by the permanent block on the original
-one.
+anyway, since that mapping is internal to the proxy and SimpleLogin.
+
+To identify which recipient was refused, read the `detail` column of
+that fingerprint's row in the SQLite cache directly:
+
+```bash
+sqlite3 /data/cache.sqlite3 \
+  "SELECT fingerprint, detail FROM forwarded_messages WHERE status = 'partial'"
+```
+
+`detail` is a small JSON object (`refused_recipients`, `refused_smtp_codes`)
+recorded on the row at the moment of the partial acceptance, and is never
+written to any log stream -- an operator reads it the same way they would
+already read the `contacts` table's plaintext email addresses, the same
+local trust boundary. This is the durable recovery path, not a
+`LOG_LEVEL=DEBUG` log line: because the fingerprint can never be
+reforwarded (see above), the exact submission can never be replayed
+later to reproduce the missing detail if it was only ever logged at a
+level nobody happened to be watching at the time. (`forwarder.py` still
+emits the same detail at `DEBUG`, off by default, purely as a live-
+tailing convenience -- not as the thing to rely on after the fact.)
+With the refused recipient identified, the operator (or the original
+sender, for recipients they typed themselves and who were not rewritten
+to a reverse alias) can send a new, standalone message to just that
+recipient -- a fresh compose gets its own fingerprint and is unaffected
+by the permanent block on the original one.
 
 ### Leases, renewal, and recovering from a crash
 
@@ -319,12 +334,14 @@ cannot make SMTP itself exactly-once. Treat all of the above as reducing
 the odds of an accidental duplicate send or a wrongly-rejected retry, not
 eliminating them.
 
-The `forwarded_messages` SQLite table gained a `status` column (`pending`,
-`completed`, `partial`, or `failed`) and an `attempt_id` column in this
-change. Both are added with an additive, idempotent migration run on
-every connection, so an existing persistent `/data/cache.sqlite3` volume
-from an earlier
-version of this feature upgrades in place with no manual steps. Rows with
+The `forwarded_messages` SQLite table gained `status` (`pending`,
+`completed`, `partial`, or `failed`), `attempt_id`, and `detail` columns
+in this change. All are added with an additive, idempotent migration run
+on every connection, so an existing persistent `/data/cache.sqlite3`
+volume from an earlier
+version of this feature upgrades in place with no manual steps. `detail`
+is populated only for `partial` rows (see "Partial recipient acceptance"
+above); it is `NULL` for every other status. Rows with
 status `partial` are never swept up by the opportunistic pruning that
 otherwise bounds this table's size (see above) -- they are expected to be
 rare, and an operator who resolves one by hand can delete its row
