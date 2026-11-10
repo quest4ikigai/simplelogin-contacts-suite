@@ -24,7 +24,12 @@ from simplelogin_client import RequestStats
 from .cache import ReservationResult, SQLiteAliasCache
 from .config import SmtpProxyConfig
 from .config_validation import validate_startup_config
-from .forwarder import UpstreamForwardingError, UpstreamSmtpForwarder, safe_forwarding_error_fields
+from .forwarder import (
+    ForwardResult,
+    UpstreamForwardingError,
+    UpstreamSmtpForwarder,
+    safe_forwarding_error_fields,
+)
 from .logging import audit_event, plan_audit_fields, plan_summary, redact_address, safe_reason
 from .message_transform import (
     apply_transform,
@@ -516,6 +521,32 @@ class SmtpProxyHandler:
                 )
                 return "250 Message already accepted for delivery"
 
+            if reservation.outcome == "partial":
+                # The upstream SMTP server already confirmed-accepted
+                # some recipients and confirmed-refused the rest of this
+                # exact message within the suppression window. The proxy
+                # cannot resend to only the refused subset, so -- exactly
+                # like "completed" -- this must never be forwarded again
+                # automatically: that would redeliver to the recipients
+                # already accepted.
+                LOGGER.info(
+                    "audit %s",
+                    audit_event(
+                        "smtp_duplicate_partial_delivery",
+                        peer=peer,
+                        correlation_id=correlation_id,
+                        policy="duplicate_partial_delivery",
+                        prior_correlation_id=reservation.prior_attempt_id or "unknown",
+                        recipient_count=len(recipients),
+                    ),
+                )
+                return (
+                    "451 A matching submission was already partially delivered to some "
+                    "recipients and refused for others; it will not be forwarded again "
+                    "automatically. Contact your mail administrator to identify and "
+                    "resend to the affected recipient(s) only."
+                )
+
             if reservation.outcome in ("in_flight", "abandoned"):
                 # A matching submission is either genuinely still being
                 # forwarded ("in_flight") or its reservation lease expired
@@ -551,7 +582,7 @@ class SmtpProxyHandler:
                     "delivery outcome is not yet confirmed; please retry shortly"
                 )
 
-        await self._forward_and_record(
+        result = await self._forward_and_record(
             correlation_id=correlation_id,
             peer=peer,
             sender=sender,
@@ -560,6 +591,26 @@ class SmtpProxyHandler:
             fingerprint=fingerprint,
             started=started,
         )
+        if result.refused_count:
+            # Some recipients were confirmed-accepted and some were
+            # confirmed-refused by the upstream server. A plain 250
+            # would misreport this as complete success; a plain 550
+            # would claim the whole submission failed even though most
+            # (or all but one) recipients already received it. Report a
+            # temporary failure instead: it correctly signals that the
+            # submission, as a whole, did not succeed as sent, while the
+            # dedup state machine above (see the "partial" outcome)
+            # guarantees that even a blind client retry of this exact
+            # message can never redeliver to the recipients already
+            # accepted.
+            return (
+                f"451 Message delivered to {result.accepted_count} of "
+                f"{result.total_count} recipient(s); {result.refused_count} "
+                "recipient(s) were refused by the upstream mail server and did NOT "
+                "receive this message. It will not be forwarded again automatically "
+                "for the same recipients. Contact your mail administrator to identify "
+                "and resend to the affected recipient(s) only."
+            )
         return "250 Message accepted for delivery"
 
     async def _renew_reservation_periodically(self, fingerprint: str, attempt_id: str) -> None:
@@ -597,7 +648,7 @@ class SmtpProxyHandler:
         message: Message,
         fingerprint: Optional[str],
         started: float,
-    ) -> None:
+    ) -> ForwardResult:
         loop = asyncio.get_running_loop()
         renew_task = None
         if fingerprint:
@@ -605,7 +656,7 @@ class SmtpProxyHandler:
                 self._renew_reservation_periodically(fingerprint, correlation_id)
             )
         try:
-            await loop.run_in_executor(
+            result = await loop.run_in_executor(
                 self._forward_executor,
                 self.forwarder.forward,
                 sender,
@@ -693,6 +744,45 @@ class SmtpProxyHandler:
                 except asyncio.CancelledError:
                     pass
 
+        forward_duration_ms = int((time.monotonic() - started) * 1000)
+        if result.is_partial:
+            # The upstream server confirmed-accepted some recipients and
+            # confirmed-refused the rest (smtplib raises instead of
+            # returning when *every* recipient is refused -- see
+            # ForwardResult). Record this as its own terminal state,
+            # distinct from both "completed" and "failed": the accepted
+            # recipients already received the message, so the fingerprint
+            # must never become eligible for an automatic full resend,
+            # exactly like a completed send.
+            if fingerprint:
+                try:
+                    await loop.run_in_executor(
+                        self._dedup_executor,
+                        functools.partial(
+                            self._dedup_cache.mark_partial,
+                            fingerprint,
+                            correlation_id,
+                            prune_older_than_seconds=self._dedup_prune_window_seconds(),
+                        ),
+                    )
+                except Exception:
+                    LOGGER.exception("Failed to record forwarded-message dedup partial outcome")
+            LOGGER.info(
+                "audit %s",
+                audit_event(
+                    "smtp_message_partially_forwarded",
+                    peer=peer,
+                    correlation_id=correlation_id,
+                    recipient_count=result.total_count,
+                    accepted_count=result.accepted_count,
+                    refused_count=result.refused_count,
+                    refused_smtp_codes=list(result.refused_smtp_codes),
+                    forward_duration_ms=forward_duration_ms,
+                    duplicate_suppression_state="partial",
+                ),
+            )
+            return result
+
         if fingerprint:
             try:
                 await loop.run_in_executor(
@@ -713,9 +803,10 @@ class SmtpProxyHandler:
                 peer=peer,
                 correlation_id=correlation_id,
                 recipient_count=len(recipients),
-                forward_duration_ms=int((time.monotonic() - started) * 1000),
+                forward_duration_ms=forward_duration_ms,
             ),
         )
+        return result
 
     def handle_exception(self, error: Exception) -> str:
         LOGGER.exception("SMTP proxy handler failed: %s", type(error).__name__)

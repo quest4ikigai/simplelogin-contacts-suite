@@ -202,6 +202,36 @@ class ForwardedMessageDedupTests(unittest.TestCase):
             rows = conn.execute("SELECT fingerprint FROM forwarded_messages").fetchall()
         self.assertEqual(rows, [])
 
+    def test_retry_after_partial_delivery_is_reported_as_partial(self):
+        # Regression for Codex's finding: a message where the upstream
+        # confirmed-accepted some recipients and confirmed-refused the
+        # rest must not be reported as a plain "completed" success nor
+        # as a retryable "failed" -- a retry would otherwise either
+        # misreport the outcome or redeliver to the already-accepted
+        # recipients.
+        self._reserve("fp-1", "attempt-1")
+        self.cache.mark_partial("fp-1", "attempt-1", prune_older_than_seconds=3600)
+
+        result = self._reserve("fp-1", "attempt-2")
+
+        self.assertEqual(result.outcome, "partial")
+        self.assertEqual(result.prior_attempt_id, "attempt-1")
+
+    def test_partial_delivery_entry_older_than_window_is_reclaimed(self):
+        # Like a completed send, a partial delivery is only reclaimable
+        # once it falls outside the suppression window -- not
+        # immediately, the way a confirmed failure is.
+        self._reserve("fp-1", "attempt-1", window=3600)
+        self.cache.mark_partial("fp-1", "attempt-1", prune_older_than_seconds=3600)
+
+        still_blocked = self._reserve("fp-1", "attempt-2", window=3600)
+        self.assertEqual(still_blocked.outcome, "partial")
+
+        self._age_fingerprint("fp-1", seconds=7200)
+        result = self._reserve("fp-1", "attempt-3", window=3600)
+
+        self.assertEqual(result.outcome, "claimed")
+
     def test_completed_entry_older_than_window_is_reclaimed(self):
         self._reserve("fp-1", "attempt-1", window=3600)
         self.cache.mark_forwarded("fp-1", "attempt-1", prune_older_than_seconds=3600)

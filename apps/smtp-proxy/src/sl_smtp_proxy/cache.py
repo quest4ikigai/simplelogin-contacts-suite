@@ -56,6 +56,13 @@ class ReservationResult:
         yet, but it is not a confirmed duplicate either.
       - "completed": the fingerprint was already forwarded successfully
         within the suppression window.
+      - "partial": the fingerprint was already forwarded within the
+        suppression window, but the upstream server confirmed-accepted
+        only some of the recipients and confirmed-refused the rest.
+        Treated like "completed" for reclaim purposes (not immediately
+        retryable, unlike "failed"): the proxy has no way to resend to
+        only the refused subset, so the accepted subset must never be
+        sent again.
     """
 
     outcome: str
@@ -383,9 +390,17 @@ class SQLiteAliasCache:
                 WHERE
                   forwarded_messages.status = 'failed'
                   OR (forwarded_messages.status = 'completed' AND forwarded_messages.forwarded_at < ?)
+                  OR (forwarded_messages.status = 'partial' AND forwarded_messages.forwarded_at < ?)
                   OR (forwarded_messages.status = 'pending' AND forwarded_messages.forwarded_at < ?)
                 """,
-                (fingerprint, now_iso, attempt_id, completed_cutoff, abandoned_cutoff),
+                (
+                    fingerprint,
+                    now_iso,
+                    attempt_id,
+                    completed_cutoff,
+                    completed_cutoff,
+                    abandoned_cutoff,
+                ),
             )
             if cursor.rowcount == 1:
                 return ReservationResult(outcome="claimed")
@@ -405,6 +420,8 @@ class SQLiteAliasCache:
         status, forwarded_at, prior_attempt_id = row
         if status == "completed":
             return ReservationResult(outcome="completed", prior_attempt_id=prior_attempt_id)
+        if status == "partial":
+            return ReservationResult(outcome="partial", prior_attempt_id=prior_attempt_id)
 
         age_seconds = None
         if forwarded_at:
@@ -476,6 +493,23 @@ class SQLiteAliasCache:
         legitimate retry to reclaim -- see try_reserve_forwarding.
         """
         self._resolve_reservation(fingerprint, attempt_id, "failed", prune_older_than_seconds)
+
+    def mark_partial(
+        self,
+        fingerprint: str,
+        attempt_id: str,
+        prune_older_than_seconds: int,
+    ) -> None:
+        """Mark this attempt's reservation as a confirmed partial delivery.
+
+        Some recipients were confirmed accepted by the upstream server
+        and some were confirmed refused. Treated like a completed send
+        for reclaim purposes, not like a failure: the proxy has no way
+        to resend to only the refused subset, so an identical retry must
+        never be allowed to redeliver to the recipients already accepted
+        -- see try_reserve_forwarding.
+        """
+        self._resolve_reservation(fingerprint, attempt_id, "partial", prune_older_than_seconds)
 
     def _resolve_reservation(
         self,

@@ -168,6 +168,14 @@ response to a submission depends on which:
   forwarding again, and logs an `smtp_duplicate_already_delivered` audit
   event -- the client sees success, honestly, instead of either a spurious
   error or a second delivery.
+- **Forwarding partially accepted.** The upstream server confirmed-accepted
+  *some* recipients and confirmed-refused the rest of the same matching
+  message (see "Partial recipient acceptance" below). Like "completed",
+  this is never automatically reforwarded -- the proxy has no way to
+  resend to only the refused subset, so the recipients already accepted
+  must never receive a second copy. A resubmission is deferred with `451`
+  and an `smtp_duplicate_partial_delivery` audit event, not reported as
+  outright success or forwarded again.
 - **Forwarding confirmed failed.** A matching attempt raised a confirmed
   `UpstreamForwardingError` -- one known to have occurred *before* any
   message data was sent (connection refused, EHLO/STARTTLS/AUTH failure)
@@ -206,6 +214,54 @@ response to a submission depends on which:
   pending rather than guessing; it is then handled by the *same*
   pending/abandoned logic above as time passes. See "Diagnostics and
   logging" below for how this is still audited.
+
+### Partial recipient acceptance
+
+`smtplib.SMTP.sendmail()` raises `SMTPRecipientsRefused` only when *every*
+recipient is refused. Whenever at least one recipient is accepted, it
+instead returns normally with a dict of whichever recipients *were*
+refused (empty if none were) -- and the message has already been fully
+transmitted and accepted for the rest by that point. The proxy inspects
+that return value rather than treating "no exception" as "everyone got
+it": a message to several recipients where the upstream server accepts
+most of them and refuses one (a typo'd address, a full mailbox, a
+recipient-level policy rejection) is recorded as **partially accepted**,
+distinct from both a complete success and a complete failure.
+
+SMTP has no way to give a *per-recipient* reply at this stage -- the
+proxy already replied `250 OK` to every `RCPT TO` when the client
+submitted the message, before it knew the full MIME content or had
+contacted the upstream server, so the only thing left to answer is the
+single reply to `DATA`. A plain `250` here would misreport the refused
+recipient as having received the message; a plain `550` would claim the
+*entire* submission failed even though most of it was delivered and
+would invite the sender to resend to everyone, duplicating the delivery
+to those who already got it. The proxy instead returns a temporary
+`451` whose text states the actual split -- `"451 Message delivered to
+N of M recipient(s); R recipient(s) were refused by the upstream mail
+server..."` -- and logs an `smtp_message_partially_forwarded` audit
+event with `accepted_count`, `refused_count`, the total `recipient_count`,
+and the upstream's numeric `refused_smtp_codes`. The dedup reservation is
+marked `partial` (see above), so even if the client or a human blindly
+resends the identical message, the proxy will not forward it again --
+the response to that resubmission says so explicitly.
+
+Recovering from a partial acceptance is necessarily a manual step: the
+proxy has no mechanism to resend to only the refused recipient (SMTP
+submission here is all-or-nothing per message), and it does not attempt
+automatic recipient-level retries. Recipient addresses are deliberately
+never written to the normal audit log or the `451` response -- for
+addresses rewritten to a SimpleLogin reverse alias, the original sender
+could not identify the affected recipient from the raw refused address
+anyway, since that mapping is internal to the proxy and SimpleLogin. To
+identify which recipient was refused, an operator can temporarily set
+`LOG_LEVEL=DEBUG`: `forwarder.py` logs the refused recipient(s) and the
+upstream's raw rejection text at `DEBUG` only, as a narrowly-scoped
+diagnostic path that is off by default and should be turned back off
+once the affected recipient has been identified. With that in hand, the
+operator (or the original sender, for recipients they typed themselves
+and who were not rewritten to a reverse alias) can send a new,
+standalone message to just that recipient.
 
 ### Leases, renewal, and recovering from a crash
 
@@ -247,9 +303,10 @@ the odds of an accidental duplicate send or a wrongly-rejected retry, not
 eliminating them.
 
 The `forwarded_messages` SQLite table gained a `status` column (`pending`,
-`completed`, or `failed`) and an `attempt_id` column in this change. Both
-are added with an additive, idempotent migration run on every connection,
-so an existing persistent `/data/cache.sqlite3` volume from an earlier
+`completed`, `partial`, or `failed`) and an `attempt_id` column in this
+change. Both are added with an additive, idempotent migration run on
+every connection, so an existing persistent `/data/cache.sqlite3` volume
+from an earlier
 version of this feature upgrades in place with no manual steps.
 
 ## Diagnostics and logging
@@ -261,6 +318,11 @@ across a client disconnect. Every forwarding attempt reaches exactly one
 of these terminal audit events -- none of them is ever silently skipped:
 
 - `smtp_message_forwarded`: forwarded and accepted upstream.
+- `smtp_message_partially_forwarded`: the upstream server
+  confirmed-accepted some recipients and confirmed-refused the rest; see
+  "Partial recipient acceptance" above. Carries `accepted_count`,
+  `refused_count`, the total `recipient_count`, and `refused_smtp_codes`
+  -- never the refused addresses themselves.
 - `smtp_message_rejected` (`policy=upstream_unavailable`): a confirmed
   forwarding failure (`UpstreamForwardingError`).
 - `smtp_forwarding_outcome_unknown` (`policy=internal_error`): an
@@ -276,6 +338,9 @@ of these terminal audit events -- none of them is ever silently skipped:
   pending; see "Delivery-state handling" above.
 - `smtp_duplicate_already_delivered`: a matching submission already
   completed; reported as success without forwarding again.
+- `smtp_duplicate_partial_delivery`: a matching submission already
+  partially delivered; deferred with `451` without forwarding again,
+  rather than being reported as either success or a fresh failure.
 - `smtp_client_disconnected_during_processing`: the submitting client
   disconnected before a response could be sent, carrying the same
   `correlation_id` as whichever of the above events eventually resolves

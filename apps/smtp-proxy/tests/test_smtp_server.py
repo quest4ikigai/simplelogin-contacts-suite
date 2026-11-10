@@ -34,7 +34,12 @@ sys.path.insert(0, os.path.abspath(SIMPLELOGIN_SRC))
 from sl_smtp_proxy.cache import SQLiteAliasCache
 from sl_smtp_proxy.config import SmtpProxyConfig, load_config_from_env
 from sl_smtp_proxy.config_validation import StartupConfigError
-from sl_smtp_proxy.forwarder import UpstreamForwardingError, UpstreamSmtpForwarder, safe_forwarding_error_fields
+from sl_smtp_proxy.forwarder import (
+    ForwardResult,
+    UpstreamForwardingError,
+    UpstreamSmtpForwarder,
+    safe_forwarding_error_fields,
+)
 from sl_smtp_proxy.healthcheck import check_health
 from sl_smtp_proxy.message_transform import apply_transform, build_plan_for_message
 from sl_smtp_proxy.smtp_server import SmtpProxyServer, _forward_fingerprint
@@ -168,6 +173,33 @@ def mail_from_response(port, mail_from="sender@example.com"):
 class CaptureUpstreamHandler:
     def __init__(self):
         self.messages = []
+
+    async def handle_DATA(self, server, session, envelope):
+        self.messages.append({
+            "mail_from": envelope.mail_from,
+            "rcpt_tos": list(envelope.rcpt_tos),
+            "content": envelope.original_content,
+        })
+        return "250 OK"
+
+
+class PartiallyRefusingUpstreamHandler:
+    """A real fake upstream SMTP server (exercising the actual smtplib
+    client code path, not a mock) that refuses specific recipients at
+    RCPT TO time and accepts the rest, so smtp.sendmail() takes its real
+    partial-acceptance return path: a non-empty refused dict without
+    raising SMTPRecipientsRefused, since not every recipient is refused.
+    """
+
+    def __init__(self, refused_recipients):
+        self.refused_recipients = set(refused_recipients)
+        self.messages = []
+
+    async def handle_RCPT(self, server, session, envelope, address, rcpt_options):
+        if address in self.refused_recipients:
+            return "550 Mailbox unavailable"
+        envelope.rcpt_tos.append(address)
+        return "250 OK"
 
     async def handle_DATA(self, server, session, envelope):
         self.messages.append({
@@ -389,6 +421,21 @@ class AlwaysRaisesUnexpectedForwarder:
 
     def forward(self, sender, recipients, message):
         raise RuntimeError("simulated unexpected forwarding bug")
+
+
+class AlwaysPartiallyRefusesForwarder:
+    """A forwarder whose forward() always returns a ForwardResult
+    reporting one accepted and one refused recipient, for exercising the
+    "partial" dedup state deterministically without depending on a real
+    upstream.
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    def forward(self, sender, recipients, message):
+        self.calls += 1
+        return ForwardResult(accepted_count=1, refused_count=1, refused_smtp_codes=(550,))
 
 
 class AlwaysFailsAmbiguouslyForwarder:
@@ -750,6 +797,120 @@ class UpstreamForwarderTests(unittest.TestCase):
 
         self.assertTrue(raised.exception.ambiguous_delivery)
         self.assertIsInstance(raised.exception.__cause__, smtplib.SMTPServerDisconnected)
+
+    def test_all_recipients_accepted_returns_full_forward_result(self):
+        # Regression for Codex's finding: forward() must inspect
+        # sendmail()'s return value rather than ignore it. All-accepted
+        # (an empty refused dict) must report zero refusals.
+        smtp = mock.MagicMock()
+        smtp.sendmail.return_value = {}
+
+        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp):
+            result = UpstreamSmtpForwarder(SmtpProxyConfig()).forward(
+                "sender@example.com",
+                ["alice@example.com", "bob@example.com"],
+                self._message(),
+            )
+
+        self.assertEqual(result.accepted_count, 2)
+        self.assertEqual(result.refused_count, 0)
+        self.assertEqual(result.total_count, 2)
+        self.assertFalse(result.is_partial)
+
+    def test_partial_recipient_refusal_is_detected_and_counted(self):
+        # Regression for Codex's finding: sendmail() returns normally
+        # (not raising SMTPRecipientsRefused) whenever at least one
+        # recipient was accepted, with a dict of the recipients that
+        # were refused. Ignoring that dict previously made the proxy
+        # treat this as complete success.
+        smtp = mock.MagicMock()
+        smtp.sendmail.return_value = {
+            "bob@example.com": (550, b"mailbox unavailable"),
+        }
+
+        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp):
+            result = UpstreamSmtpForwarder(SmtpProxyConfig()).forward(
+                "sender@example.com",
+                ["alice@example.com", "bob@example.com"],
+                self._message(),
+            )
+
+        self.assertEqual(result.accepted_count, 1)
+        self.assertEqual(result.refused_count, 1)
+        self.assertEqual(result.total_count, 2)
+        self.assertTrue(result.is_partial)
+        self.assertEqual(result.refused_smtp_codes, (550,))
+
+    def test_all_recipients_refused_still_raises_confirmed_failure(self):
+        # When *every* recipient is refused, smtplib raises
+        # SMTPRecipientsRefused instead of returning -- this must still
+        # be treated as a complete, confirmed failure, never as partial
+        # acceptance (accepted_count would otherwise be a nonsensical 0).
+        smtp = mock.MagicMock()
+        smtp.sendmail.side_effect = smtplib.SMTPRecipientsRefused(
+            {
+                "alice@example.com": (550, b"mailbox unavailable"),
+                "bob@example.com": (550, b"mailbox unavailable"),
+            }
+        )
+
+        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp):
+            with self.assertRaises(UpstreamForwardingError) as raised:
+                UpstreamSmtpForwarder(SmtpProxyConfig()).forward(
+                    "sender@example.com",
+                    ["alice@example.com", "bob@example.com"],
+                    self._message(),
+                )
+
+        self.assertFalse(raised.exception.ambiguous_delivery)
+
+    def test_connection_lost_during_sendmail_is_not_misclassified_as_partial(self):
+        # Regression guard: a connection lost or timed out while
+        # sendmail() is transmitting must still raise (ambiguous,
+        # outcome-unknown), never be confused with the new partial-
+        # acceptance return path, which only applies when sendmail()
+        # returns normally.
+        smtp = mock.MagicMock()
+        smtp.sendmail.side_effect = smtplib.SMTPServerDisconnected("Connection unexpectedly closed")
+
+        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp):
+            with self.assertRaises(UpstreamForwardingError) as raised:
+                UpstreamSmtpForwarder(SmtpProxyConfig()).forward(
+                    "sender@example.com",
+                    ["alice@example.com", "bob@example.com"],
+                    self._message(),
+                )
+
+        self.assertTrue(raised.exception.ambiguous_delivery)
+
+    def test_partial_refusal_diagnostic_detail_is_logged_only_at_debug(self):
+        # Privacy regression guard: the refused recipient's address and
+        # the upstream's raw response text must never appear in the
+        # module's normal-operation logs (WARNING and above are not
+        # emitted for a partial refusal at all, since it isn't an
+        # error). They may appear in a DEBUG-level log line -- a
+        # narrowly-scoped, opt-in diagnostic path an operator must
+        # explicitly enable -- and nowhere else.
+        secret_address = "donor-alice-smith@example.com"
+        secret_text = b"mailbox disabled for " + secret_address.encode()
+        smtp = mock.MagicMock()
+        smtp.sendmail.return_value = {secret_address: (550, secret_text)}
+
+        logger = logging.getLogger("sl_smtp_proxy.forwarder")
+        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp):
+            with self.assertLogs(logger, level="DEBUG") as captured:
+                result = UpstreamSmtpForwarder(SmtpProxyConfig()).forward(
+                    "sender@example.com",
+                    [secret_address],
+                    self._message(),
+                )
+
+        self.assertEqual(result.refused_count, 1)
+        debug_lines = [line for line in captured.output if line.startswith("DEBUG:")]
+        other_lines = [line for line in captured.output if not line.startswith("DEBUG:")]
+        self.assertTrue(any(secret_address in line for line in debug_lines))
+        for line in other_lines:
+            self.assertNotIn(secret_address, line)
 
 
 class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
@@ -3035,6 +3196,268 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(recovered[0], 451)
             self.assertIn("confirmation", recovered[1].lower())
             self.assertEqual(ambiguous_forwarder.calls, 2)
+        finally:
+            await proxy.stop()
+
+    async def test_partial_recipient_refusal_returns_temporary_failure_and_records_partial_state(
+        self,
+    ):
+        # Regression for Codex's finding: smtplib.SMTP.sendmail() can
+        # accept some recipients and refuse others without raising --
+        # the proxy previously ignored that return value entirely and
+        # reported complete success. Through a real (not mocked)
+        # upstream server that refuses one recipient at RCPT TO time,
+        # the proxy must report a temporary failure describing the
+        # partial outcome, forward only to the accepted recipient, and
+        # record a dedicated "partial" dedup state rather than
+        # "completed" or "failed".
+        upstream_handler = PartiallyRefusingUpstreamHandler({"reply+bob@simplelogin.co"})
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+            ),
+            reverse_alias_resolver=lambda recipient, alias: (
+                f"reply+{recipient.split('@', 1)[0]}@simplelogin.co"
+            ),
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com, bob@example.com"
+            msg["Message-Id"] = "<partial-accept@example.com>"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            with self.assertLogs("sl_smtp_proxy.smtp_server", level="INFO") as captured:
+                result = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    submit_message,
+                    proxy.port,
+                    msg,
+                    ["alice@example.com", "bob@example.com"],
+                )
+
+            self.assertEqual(result[0], 451)
+            self.assertIn("delivered to 1 of 2", result[1].lower())
+            self.assertEqual(len(upstream_handler.messages), 1)
+            self.assertEqual(
+                upstream_handler.messages[0]["rcpt_tos"], ["reply+alice@simplelogin.co"]
+            )
+
+            audit_payloads = [
+                json.loads(line.split("audit ", 1)[1])
+                for line in captured.output
+                if "audit " in line
+            ]
+            partial_events = [
+                p for p in audit_payloads if p["event"] == "smtp_message_partially_forwarded"
+            ]
+            self.assertEqual(len(partial_events), 1)
+            self.assertEqual(partial_events[0]["accepted_count"], 1)
+            self.assertEqual(partial_events[0]["refused_count"], 1)
+            self.assertEqual(partial_events[0]["recipient_count"], 2)
+            self.assertEqual(partial_events[0]["refused_smtp_codes"], [550])
+            self.assertEqual(partial_events[0]["duplicate_suppression_state"], "partial")
+            joined_logs = "\n".join(captured.output)
+            self.assertNotIn("bob@example.com", joined_logs)
+            self.assertNotIn("reply+bob", joined_logs)
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
+    async def test_retry_after_partial_acceptance_does_not_redeliver_to_accepted_recipients(
+        self,
+    ):
+        # Regression for Codex's finding: an identical retry of a
+        # partially-accepted message must never redeliver to the
+        # recipient that already received it. The dedup state machine's
+        # new "partial" outcome must block automatic reforwarding, just
+        # like "completed" does.
+        upstream_handler = PartiallyRefusingUpstreamHandler({"reply+bob@simplelogin.co"})
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+            ),
+            reverse_alias_resolver=lambda recipient, alias: (
+                f"reply+{recipient.split('@', 1)[0]}@simplelogin.co"
+            ),
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com, bob@example.com"
+            msg["Message-Id"] = "<partial-retry@example.com>"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            loop = asyncio.get_running_loop()
+            first = await loop.run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com", "bob@example.com"]
+            )
+            self.assertEqual(first[0], 451)
+            self.assertEqual(len(upstream_handler.messages), 1)
+
+            retry = await loop.run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com", "bob@example.com"]
+            )
+            self.assertEqual(retry[0], 451)
+            self.assertIn("already partially delivered", retry[1].lower())
+            # Not forwarded again: the accepted recipient must not
+            # receive a second copy.
+            self.assertEqual(len(upstream_handler.messages), 1)
+        finally:
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
+    async def test_concurrent_retry_during_partial_forwarding_is_deferred(self):
+        # The existing in-flight/lease reservation mechanism must keep
+        # working unchanged when the eventual outcome is partial: a
+        # genuinely concurrent duplicate must be deferred (451, not
+        # forwarded) while the first attempt is still in progress.
+        partial_forwarder = AlwaysPartiallyRefusesForwarder()
+        blocking_forwarder = BlockingForwarder(partial_forwarder)
+        proxy = SmtpProxyServer(
+            local_smtp_config(host="127.0.0.1", port=0, require_auth=False, dry_run=False),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+            forwarder=blocking_forwarder,
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["Message-Id"] = "<partial-concurrent@example.com>"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            loop = asyncio.get_running_loop()
+            first_send = loop.run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+            started = await loop.run_in_executor(None, blocking_forwarder.started.wait, 2.0)
+            self.assertTrue(started, "forward() never started")
+
+            concurrent = await asyncio.wait_for(
+                loop.run_in_executor(None, submit_message, proxy.port, msg, ["alice@example.com"]),
+                timeout=3.0,
+            )
+            blocking_forwarder.release.set()
+            self.assertEqual(concurrent[0], 451)
+            self.assertIn("already being processed", concurrent[1])
+
+            first = await asyncio.wait_for(first_send, timeout=3.0)
+            self.assertEqual(first[0], 451)
+            self.assertIn("delivered to 1 of 2", first[1].lower())
+            # Only the genuinely first attempt ever reached forward():
+            # the concurrent duplicate was deferred without calling it.
+            self.assertEqual(partial_forwarder.calls, 1)
+        finally:
+            await proxy.stop()
+
+    async def test_client_disconnect_during_partial_forwarding_still_records_partial_outcome(
+        self,
+    ):
+        # Regression for Codex's finding (requirement: partial
+        # acceptance must survive a client disconnect, like every other
+        # terminal forwarding outcome in this PR): if the submitting
+        # client disconnects before the response arrives, the shielded
+        # forwarding task must still run to completion, record the
+        # "partial" dedup state, and emit the audit event -- never lose
+        # the outcome just because nobody is left to read it.
+        partial_forwarder = AlwaysPartiallyRefusesForwarder()
+        blocking_forwarder = BlockingForwarder(partial_forwarder)
+        proxy = SmtpProxyServer(
+            local_smtp_config(host="127.0.0.1", port=0, require_auth=False, dry_run=False),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+            forwarder=blocking_forwarder,
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["Message-Id"] = "<partial-disconnect@example.com>"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            loop = asyncio.get_running_loop()
+            with self.assertLogs("sl_smtp_proxy.smtp_server", level="INFO") as captured:
+                disconnecting_send = loop.run_in_executor(
+                    None,
+                    submit_message_and_disconnect,
+                    proxy.port,
+                    msg,
+                    ["alice@example.com"],
+                )
+
+                started = await loop.run_in_executor(None, blocking_forwarder.started.wait, 2.0)
+                self.assertTrue(started, "forward() never started")
+                await asyncio.wait_for(disconnecting_send, timeout=3.0)
+
+                blocking_forwarder.release.set()
+                completed = await loop.run_in_executor(None, blocking_forwarder.completed.wait, 3.0)
+                self.assertTrue(completed, "forward() never completed after being released")
+
+                self.assertTrue(
+                    await _wait_until_async(
+                        lambda: any(
+                            "smtp_message_partially_forwarded" in line
+                            for line in captured.output
+                        ),
+                        timeout=2.0,
+                    ),
+                    "expected a smtp_message_partially_forwarded audit event after disconnect",
+                )
+
+            audit_payloads = [
+                json.loads(line.split("audit ", 1)[1])
+                for line in captured.output
+                if "audit " in line
+            ]
+            partial_events = [
+                p for p in audit_payloads if p["event"] == "smtp_message_partially_forwarded"
+            ]
+            self.assertEqual(len(partial_events), 1)
+
+            # The dedup state was recorded despite the disconnect: an
+            # identical resubmission must now see "already partially
+            # delivered" rather than forwarding again.
+            retry = await loop.run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+            self.assertEqual(retry[0], 451)
+            self.assertIn("already partially delivered", retry[1].lower())
+            self.assertEqual(partial_forwarder.calls, 1)
         finally:
             await proxy.stop()
 

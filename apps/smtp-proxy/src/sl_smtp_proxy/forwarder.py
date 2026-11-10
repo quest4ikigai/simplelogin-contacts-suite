@@ -3,9 +3,10 @@ from __future__ import annotations
 import logging
 import smtplib
 import ssl
+from dataclasses import dataclass
 from email import policy
 from email.message import Message
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 from .config import SmtpProxyConfig
 
@@ -34,6 +35,38 @@ _NETWORK_ERROR_CATEGORIES = (
 )
 
 
+@dataclass(frozen=True)
+class ForwardResult:
+    """Outcome of a sendmail() call that completed without raising.
+
+    smtplib.SMTP.sendmail() raises SMTPRecipientsRefused only when every
+    recipient was refused; otherwise it returns normally with a dict of
+    the recipients that *were* refused (empty if none were), even though
+    the message was already fully transmitted and accepted for the rest.
+    accepted_count is therefore always >= 1 here -- "all refused" is a
+    confirmed failure handled via the exception path in forward(), not
+    this result.
+    """
+
+    accepted_count: int
+    refused_count: int
+    # Numeric SMTP codes the upstream used to refuse recipients, deduped
+    # and sorted. Never the raw response text or the refused addresses
+    # themselves, which smtplib's own refusal dict embeds -- see
+    # safe_forwarding_error_fields for why that's never safe to log or
+    # audit as-is. A narrowly-scoped diagnostic log of the full dict is
+    # emitted at DEBUG level in forward() below, off by default.
+    refused_smtp_codes: Tuple[int, ...] = ()
+
+    @property
+    def total_count(self) -> int:
+        return self.accepted_count + self.refused_count
+
+    @property
+    def is_partial(self) -> bool:
+        return self.refused_count > 0
+
+
 class UpstreamForwardingError(RuntimeError):
     def __init__(self, public_message: str, *, ambiguous_delivery: bool = False):
         super().__init__(public_message)
@@ -54,7 +87,7 @@ class UpstreamSmtpForwarder:
     def __init__(self, config: SmtpProxyConfig):
         self.config = config
 
-    def forward(self, sender: str, recipients: Iterable[str], message: Message) -> None:
+    def forward(self, sender: str, recipients: Iterable[str], message: Message) -> ForwardResult:
         recipient_list = list(recipients)
         if not recipient_list:
             raise UpstreamForwardingError("No deliverable recipients after SimpleLogin routing")
@@ -84,7 +117,7 @@ class UpstreamSmtpForwarder:
             if self.config.upstream_username or self.config.upstream_password:
                 smtp.login(self.config.upstream_username, self.config.upstream_password)
             try:
-                smtp.sendmail(
+                refused = smtp.sendmail(
                     sender,
                     recipient_list,
                     message.as_bytes(policy=policy.SMTP),
@@ -97,7 +130,11 @@ class UpstreamSmtpForwarder:
                 # The server gave a definitive rejection reply (refused
                 # the envelope, or replied with an error code to the
                 # completed DATA command): nothing was or will be
-                # delivered. Confirmed, not ambiguous.
+                # delivered. Confirmed, not ambiguous. Note that
+                # SMTPRecipientsRefused is raised here only when *every*
+                # recipient was refused -- sendmail() returns normally
+                # (see below) whenever at least one recipient was
+                # accepted, even if others were refused.
                 raise
             except (OSError, smtplib.SMTPException) as exc:
                 # The connection was lost or timed out while sendmail()
@@ -117,6 +154,8 @@ class UpstreamSmtpForwarder:
                     smtp.close()
                 except Exception:
                     pass
+
+        return _build_forward_result(recipient_list, refused)
 
     def _raise_forwarding_error(
         self, exc: BaseException, tls_mode: str, *, ambiguous_delivery: bool
@@ -141,6 +180,24 @@ class UpstreamSmtpForwarder:
             "Upstream SMTP unavailable. Message not sent to avoid unsafe delivery.",
             ambiguous_delivery=ambiguous_delivery,
         ) from exc
+
+
+def _build_forward_result(
+    recipient_list: list, refused: Dict[str, Tuple[int, bytes]]
+) -> ForwardResult:
+    if refused:
+        # Narrowly-scoped diagnostic path: only at DEBUG (disabled by
+        # default -- see config.log_level), and only here, do refused
+        # addresses and the upstream's raw response text ever reach a
+        # log. Every other path (WARNING-level logs, audit events)
+        # carries only the counts and numeric codes below.
+        LOGGER.debug("upstream_smtp_partial_refusal refused=%r", refused)
+    refused_codes = tuple(sorted({code for code, _ in refused.values()}))
+    return ForwardResult(
+        accepted_count=len(recipient_list) - len(refused),
+        refused_count=len(refused),
+        refused_smtp_codes=refused_codes,
+    )
 
 
 def _connect_upstream(
