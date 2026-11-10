@@ -423,6 +423,20 @@ class AlwaysRaisesUnexpectedForwarder:
         raise RuntimeError("simulated unexpected forwarding bug")
 
 
+class AlwaysSucceedsForwarder:
+    """A forwarder whose forward() always returns a fully-successful
+    ForwardResult, for deterministically exercising the shutdown-drain
+    path without depending on a real upstream.
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    def forward(self, sender, recipients, message):
+        self.calls += 1
+        return ForwardResult(accepted_count=len(list(recipients)), refused_count=0)
+
+
 class AlwaysPartiallyRefusesForwarder:
     """A forwarder whose forward() always returns a ForwardResult
     reporting one accepted and one refused recipient, for exercising the
@@ -889,9 +903,13 @@ class UpstreamForwarderTests(unittest.TestCase):
         # the upstream's raw response text must never appear in the
         # module's normal-operation logs (WARNING and above are not
         # emitted for a partial refusal at all, since it isn't an
-        # error). They may appear in a DEBUG-level log line -- a
-        # narrowly-scoped, opt-in diagnostic path an operator must
-        # explicitly enable -- and nowhere else.
+        # error). By default (log_redact_addresses=True) a DEBUG-level
+        # log line -- a narrowly-scoped, opt-in diagnostic path an
+        # operator must explicitly enable -- shows only a redacted
+        # address, never the raw response text either, since that can
+        # itself echo an address back. Regression for Codex's finding:
+        # enabling DEBUG verbosity must not silently bypass this app's
+        # other, separate address-redaction setting.
         secret_address = "donor-alice-smith@example.com"
         secret_text = b"mailbox disabled for " + secret_address.encode()
         smtp = mock.MagicMock()
@@ -907,11 +925,35 @@ class UpstreamForwarderTests(unittest.TestCase):
                 )
 
         self.assertEqual(result.refused_count, 1)
-        debug_lines = [line for line in captured.output if line.startswith("DEBUG:")]
-        other_lines = [line for line in captured.output if not line.startswith("DEBUG:")]
-        self.assertTrue(any(secret_address in line for line in debug_lines))
-        for line in other_lines:
+        for line in captured.output:
             self.assertNotIn(secret_address, line)
+            self.assertNotIn("mailbox disabled", line)
+        debug_lines = [line for line in captured.output if line.startswith("DEBUG:")]
+        self.assertTrue(any("d***h@example.com" in line for line in debug_lines))
+
+    def test_partial_refusal_diagnostic_detail_shows_raw_address_when_redaction_disabled(self):
+        # The escape hatch: an operator who has explicitly set
+        # LOG_REDACT_ADDRESSES=false (accepting that trade-off for
+        # every other address this app logs) gets the full, unredacted
+        # detail here too, exactly as before this fix.
+        secret_address = "donor-alice-smith@example.com"
+        smtp = mock.MagicMock()
+        smtp.sendmail.return_value = {secret_address: (550, b"mailbox disabled")}
+
+        logger = logging.getLogger("sl_smtp_proxy.forwarder")
+        with mock.patch("sl_smtp_proxy.forwarder.smtplib.SMTP", return_value=smtp):
+            with self.assertLogs(logger, level="DEBUG") as captured:
+                result = UpstreamSmtpForwarder(
+                    SmtpProxyConfig(log_redact_addresses=False)
+                ).forward(
+                    "sender@example.com",
+                    [secret_address],
+                    self._message(),
+                )
+
+        self.assertEqual(result.refused_count, 1)
+        debug_lines = [line for line in captured.output if line.startswith("DEBUG:")]
+        self.assertTrue(any(secret_address in line for line in debug_lines))
 
 
 class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
@@ -1473,6 +1515,74 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await proxy.stop()
             upstream.stop(no_assert=True)
+
+    async def test_stop_drains_in_flight_shielded_forward_before_stopping_controller(self):
+        # Regression for Codex's finding: aiosmtpd's Controller.stop()
+        # cancels every task on its own event loop directly, not only
+        # through handle_DATA's own await -- asyncio.shield only
+        # protects the forwarding task against *that* kind of
+        # cancellation (a client disconnecting), not against being
+        # cancelled directly. Without draining first, stopping the
+        # proxy while a forward is still in flight would cut the task
+        # off before it could resolve the dedup reservation or log its
+        # audit event, even though the underlying worker thread might
+        # still go on to deliver the message upstream -- leaving the
+        # reservation stuck 'pending' until it is eventually reclaimed
+        # by age and a retry resends an already-delivered message.
+        forwarder = AlwaysSucceedsForwarder()
+        blocking_forwarder = BlockingForwarder(forwarder)
+        proxy = SmtpProxyServer(
+            local_smtp_config(host="127.0.0.1", port=0, require_auth=False, dry_run=False),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+            forwarder=blocking_forwarder,
+        )
+        await proxy.start()
+
+        msg = EmailMessage()
+        msg["From"] = "sender@example.com"
+        msg["To"] = "alice@example.com"
+        msg["Message-Id"] = "<stop-drains-forward@example.com>"
+        msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+        msg.set_content("classroom announcement")
+
+        loop = asyncio.get_running_loop()
+        cache_path = proxy.config.cache_path
+        send_future = loop.run_in_executor(
+            None, submit_message, proxy.port, msg, ["alice@example.com"]
+        )
+        stop_task = None
+        try:
+            started = await loop.run_in_executor(None, blocking_forwarder.started.wait, 2.0)
+            self.assertTrue(started, "forward() never started")
+
+            stop_task = asyncio.ensure_future(proxy.stop())
+            await asyncio.sleep(0.2)
+            self.assertFalse(
+                stop_task.done(),
+                "stop() must wait for the in-flight forward, not cut it off",
+            )
+
+            blocking_forwarder.release.set()
+            await asyncio.wait_for(stop_task, timeout=5.0)
+
+            self.assertEqual(forwarder.calls, 1)
+            with sqlite3.connect(cache_path) as conn:
+                rows = conn.execute("SELECT status FROM forwarded_messages").fetchall()
+            self.assertEqual([row[0] for row in rows], ["completed"])
+        finally:
+            # Never leave a background thread blocked on this event or a
+            # dangling connection socket behind, even if an assertion
+            # above failed -- IsolatedAsyncioTestCase's own teardown
+            # will otherwise hang for minutes joining an orphaned
+            # executor thread.
+            blocking_forwarder.release.set()
+            send_future.cancel()
+            if stop_task is not None and not stop_task.done():
+                stop_task.cancel()
+            try:
+                await asyncio.wait_for(proxy.stop(), timeout=5.0)
+            except Exception:
+                pass
 
     async def test_restarting_a_stopped_server_can_still_forward(self):
         # Regression for Codex's finding: stop() permanently shuts down the

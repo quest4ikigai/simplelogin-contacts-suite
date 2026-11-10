@@ -288,7 +288,13 @@ reforwarded (see above), the exact submission can never be replayed
 later to reproduce the missing detail if it was only ever logged at a
 level nobody happened to be watching at the time. (`forwarder.py` still
 emits the same detail at `DEBUG`, off by default, purely as a live-
-tailing convenience -- not as the thing to rely on after the fact.)
+tailing convenience -- not as the thing to rely on after the fact. That
+`DEBUG` line also honors `LOG_REDACT_ADDRESSES` exactly like every other
+address this app logs: with the default `LOG_REDACT_ADDRESSES=true`,
+addresses in it are partially masked and the upstream's raw response
+text is omitted entirely, the same as the `detail` column above;
+disabling address redaction is what shows the fully unmasked dict
+there, same as it does everywhere else in this app's logs.)
 With the refused recipient identified, the operator (or the original
 sender, for recipients they typed themselves and who were not rewritten
 to a reverse alias) can send a new, standalone message to just that

@@ -9,6 +9,7 @@ from email.message import Message
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 from .config import SmtpProxyConfig
+from .logging import redact_address
 
 
 LOGGER = logging.getLogger(__name__)
@@ -166,7 +167,9 @@ class UpstreamSmtpForwarder:
                 except Exception:
                     pass
 
-        return _build_forward_result(recipient_list, refused)
+        return _build_forward_result(
+            recipient_list, refused, redact_addresses=self.config.log_redact_addresses
+        )
 
     def _raise_forwarding_error(
         self, exc: BaseException, tls_mode: str, *, ambiguous_delivery: bool
@@ -194,20 +197,37 @@ class UpstreamSmtpForwarder:
 
 
 def _build_forward_result(
-    recipient_list: list, refused: Dict[str, Tuple[int, bytes]]
+    recipient_list: list,
+    refused: Dict[str, Tuple[int, bytes]],
+    redact_addresses: bool = True,
 ) -> ForwardResult:
     if refused:
         # Live-tailing convenience only: a narrowly-scoped DEBUG log
-        # (disabled by default -- see config.log_level) of the full
-        # dict, including the upstream's raw response text, which the
-        # refused_recipients field below deliberately omits. This is
-        # NOT the durable recovery path -- a log line emitted while
-        # nobody was watching is gone for good, and this app's own
-        # permanent "partial" dedup state means the submission can
-        # never be replayed later to reproduce it (see mark_partial).
-        # refused_recipients on the returned ForwardResult is what
-        # callers persist into the dedup cache row instead.
-        LOGGER.debug("upstream_smtp_partial_refusal refused=%r", refused)
+        # (disabled by default -- see config.log_level) of the refused
+        # recipients. This is NOT the durable recovery path -- a log
+        # line emitted while nobody was watching is gone for good, and
+        # this app's own permanent "partial" dedup state means the
+        # submission can never be replayed later to reproduce it (see
+        # mark_partial). refused_recipients on the returned
+        # ForwardResult is what callers persist into the dedup cache
+        # row instead.
+        #
+        # Honors config.log_redact_addresses exactly like every other
+        # address the proxy logs (see plan_summary/plan_audit_fields):
+        # enabling DEBUG is an operator decision about verbosity, not
+        # about accepting this app's one other privacy setting being
+        # silently bypassed. The raw dict's response text is never
+        # shown when redaction is on, either -- it can itself echo an
+        # address back (see safe_forwarding_error_fields) -- only when
+        # an operator has explicitly disabled address redaction does
+        # this log the full, unredacted dict as today.
+        if redact_addresses:
+            LOGGER.debug(
+                "upstream_smtp_partial_refusal refused=%r",
+                {redact_address(address): code for address, (code, _text) in refused.items()},
+            )
+        else:
+            LOGGER.debug("upstream_smtp_partial_refusal refused=%r", refused)
     refused_codes = tuple(sorted({code for code, _ in refused.values()}))
     return ForwardResult(
         accepted_count=len(recipient_list) - len(refused),

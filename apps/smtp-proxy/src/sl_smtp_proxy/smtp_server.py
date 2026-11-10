@@ -142,6 +142,13 @@ class SmtpProxyHandler:
         )
         self.forwarder = forwarder or UpstreamSmtpForwarder(config)
         self._dedup_cache = SQLiteAliasCache(config.cache_path)
+        # Every shielded _claim_duplicate_and_forward task currently in
+        # flight, tracked so a shutdown can wait for them -- see
+        # drain_pending_forwards(). Only ever read or mutated from the
+        # aiosmtpd controller's own event loop thread (where handle_DATA
+        # and these tasks' done-callbacks run), never from the caller's
+        # loop in SmtpProxyServer.stop().
+        self._pending_forward_tasks: set = set()
         self._open_executors()
 
     def _open_executors(self) -> None:
@@ -188,6 +195,51 @@ class SmtpProxyHandler:
         self._forward_executor.shutdown(wait=False)
         self._dedup_executor.shutdown(wait=False)
         self._closed = True
+
+    async def drain_pending_forwards(self, controller_loop: asyncio.AbstractEventLoop) -> None:
+        """Best-effort wait for in-flight shielded forwards before shutdown.
+
+        Every _claim_duplicate_and_forward task runs shielded so a
+        *client* disconnect never abandons it -- but stopping the proxy
+        itself is a different story: aiosmtpd's Controller.stop() cancels
+        every task on its own event loop directly (not through
+        handle_DATA's await, which shield only protects against), so an
+        in-flight task would otherwise be cut off mid-forward with no
+        chance to record its outcome, even though the underlying worker
+        thread keeps running and may still deliver the message upstream.
+        That would leave the reservation stuck 'pending' until it is
+        eventually reclaimed by age, allowing a future retry to resend a
+        message that was already silently delivered -- the exact
+        failure mode Goal C was meant to close, just at shutdown instead
+        of client-disconnect time.
+
+        Must run on controller_loop, not the caller's own loop: aiosmtpd
+        runs its event loop in a dedicated background thread, so these
+        tasks belong to a different loop than whatever loop
+        SmtpProxyServer.stop() happens to be awaited from. Bridged via
+        run_coroutine_threadsafe/wrap_future; the set itself is only
+        ever touched from controller_loop's thread (see the attribute's
+        docstring), so reading it inside the scheduled coroutine -- not
+        here -- avoids a cross-thread race on a plain set.
+        """
+        drain_timeout = self.config.upstream_timeout_seconds + 5
+
+        async def _wait_for_pending():
+            pending = list(self._pending_forward_tasks)
+            if not pending:
+                return set(), set()
+            return await asyncio.wait(pending, timeout=drain_timeout)
+
+        concurrent_future = asyncio.run_coroutine_threadsafe(_wait_for_pending(), controller_loop)
+        _done, still_pending = await asyncio.wrap_future(concurrent_future)
+        if still_pending:
+            LOGGER.warning(
+                "%d shielded forwarding task(s) did not finish within %ss during "
+                "shutdown; their delivery outcome may be lost if the upstream "
+                "server had not already accepted them",
+                len(still_pending),
+                drain_timeout,
+            )
 
     async def handle_MAIL(self, server, session, envelope, address, mail_options) -> str:
         if not _sender_allowed(self.config, address):
@@ -417,6 +469,8 @@ class SmtpProxyHandler:
                     started=forward_started,
                 )
             )
+            self._pending_forward_tasks.add(outcome_task)
+            outcome_task.add_done_callback(self._pending_forward_tasks.discard)
             outcome_task.add_done_callback(_swallow_task_exception)
             try:
                 return await asyncio.shield(outcome_task)
@@ -904,6 +958,12 @@ class SmtpProxyServer:
             await asyncio.sleep(3600)
 
     async def stop(self) -> None:
+        if self._controller is not None:
+            # Must happen before controller.stop(): that call cancels
+            # every task on the controller's own loop directly, which
+            # would cut off an in-flight shielded forward before it can
+            # record its outcome. See drain_pending_forwards's docstring.
+            await self.handler.drain_pending_forwards(self._controller.loop)
         self.handler.close()
         if not self._controller:
             return
