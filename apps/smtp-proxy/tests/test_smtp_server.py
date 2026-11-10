@@ -3252,7 +3252,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
                     ["alice@example.com", "bob@example.com"],
                 )
 
-            self.assertEqual(result[0], 451)
+            self.assertEqual(result[0], 550)
             self.assertIn("delivered to 1 of 2", result[1].lower())
             self.assertEqual(len(upstream_handler.messages), 1)
             self.assertEqual(
@@ -3324,13 +3324,13 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             first = await loop.run_in_executor(
                 None, submit_message, proxy.port, msg, ["alice@example.com", "bob@example.com"]
             )
-            self.assertEqual(first[0], 451)
+            self.assertEqual(first[0], 550)
             self.assertEqual(len(upstream_handler.messages), 1)
 
             retry = await loop.run_in_executor(
                 None, submit_message, proxy.port, msg, ["alice@example.com", "bob@example.com"]
             )
-            self.assertEqual(retry[0], 451)
+            self.assertEqual(retry[0], 550)
             self.assertIn("already partially delivered", retry[1].lower())
             # Not forwarded again: the accepted recipient must not
             # receive a second copy.
@@ -3376,7 +3376,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("already being processed", concurrent[1])
 
             first = await asyncio.wait_for(first_send, timeout=3.0)
-            self.assertEqual(first[0], 451)
+            self.assertEqual(first[0], 550)
             self.assertIn("delivered to 1 of 2", first[1].lower())
             # Only the genuinely first attempt ever reached forward():
             # the concurrent duplicate was deferred without calling it.
@@ -3455,7 +3455,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             retry = await loop.run_in_executor(
                 None, submit_message, proxy.port, msg, ["alice@example.com"]
             )
-            self.assertEqual(retry[0], 451)
+            self.assertEqual(retry[0], 550)
             self.assertIn("already partially delivered", retry[1].lower())
             self.assertEqual(partial_forwarder.calls, 1)
         finally:

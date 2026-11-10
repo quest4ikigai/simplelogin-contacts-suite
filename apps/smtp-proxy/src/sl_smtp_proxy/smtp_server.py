@@ -524,11 +524,16 @@ class SmtpProxyHandler:
             if reservation.outcome == "partial":
                 # The upstream SMTP server already confirmed-accepted
                 # some recipients and confirmed-refused the rest of this
-                # exact message within the suppression window. The proxy
-                # cannot resend to only the refused subset, so -- exactly
-                # like "completed" -- this must never be forwarded again
+                # exact message. The proxy cannot resend to only the
+                # refused subset, so this must never be forwarded again
                 # automatically: that would redeliver to the recipients
-                # already accepted.
+                # already accepted. Unlike "completed", this is reported
+                # as a *permanent* failure (550), not a temporary one:
+                # a 4xx response is a standing invitation for a
+                # compliant SMTP client (or an intermediate MTA) to keep
+                # retrying the identical message indefinitely, which
+                # this fingerprint must never honor, at any age -- see
+                # try_reserve_forwarding's "partial" outcome.
                 LOGGER.info(
                     "audit %s",
                     audit_event(
@@ -541,10 +546,10 @@ class SmtpProxyHandler:
                     ),
                 )
                 return (
-                    "451 A matching submission was already partially delivered to some "
-                    "recipients and refused for others; it will not be forwarded again "
-                    "automatically. Contact your mail administrator to identify and "
-                    "resend to the affected recipient(s) only."
+                    "550 A matching submission was already partially delivered to some "
+                    "recipients and refused for others; it will not be forwarded again. "
+                    "Contact your mail administrator to identify and resend to the "
+                    "affected recipient(s) only."
                 )
 
             if reservation.outcome in ("in_flight", "abandoned"):
@@ -594,22 +599,26 @@ class SmtpProxyHandler:
         if result.refused_count:
             # Some recipients were confirmed-accepted and some were
             # confirmed-refused by the upstream server. A plain 250
-            # would misreport this as complete success; a plain 550
-            # would claim the whole submission failed even though most
-            # (or all but one) recipients already received it. Report a
-            # temporary failure instead: it correctly signals that the
-            # submission, as a whole, did not succeed as sent, while the
-            # dedup state machine above (see the "partial" outcome)
-            # guarantees that even a blind client retry of this exact
-            # message can never redeliver to the recipients already
-            # accepted.
+            # would misreport this as complete success. A temporary
+            # (4xx) response was considered instead of 550, to avoid
+            # claiming the whole submission failed when most of it was
+            # delivered -- but 4xx is an explicit invitation for a
+            # compliant SMTP client or intermediate MTA to automatically
+            # retry the identical message, and the dedup state machine's
+            # "partial" outcome permanently refuses to re-forward this
+            # fingerprint precisely because that retry must never
+            # redeliver to the recipients already accepted. Reporting a
+            # retryable code here would contradict that guarantee, so
+            # this is a permanent failure (550): the submission, as
+            # sent, will never succeed, and the client must not retry it
+            # unmodified.
             return (
-                f"451 Message delivered to {result.accepted_count} of "
+                f"550 Message delivered to {result.accepted_count} of "
                 f"{result.total_count} recipient(s); {result.refused_count} "
                 "recipient(s) were refused by the upstream mail server and did NOT "
-                "receive this message. It will not be forwarded again automatically "
-                "for the same recipients. Contact your mail administrator to identify "
-                "and resend to the affected recipient(s) only."
+                "receive this message. It will not be forwarded again. Contact your "
+                "mail administrator to identify and resend to the affected "
+                "recipient(s) only."
             )
         return "250 Message accepted for delivery"
 

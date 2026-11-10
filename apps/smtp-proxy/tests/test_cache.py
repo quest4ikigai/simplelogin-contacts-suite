@@ -217,10 +217,15 @@ class ForwardedMessageDedupTests(unittest.TestCase):
         self.assertEqual(result.outcome, "partial")
         self.assertEqual(result.prior_attempt_id, "attempt-1")
 
-    def test_partial_delivery_entry_older_than_window_is_reclaimed(self):
-        # Like a completed send, a partial delivery is only reclaimable
-        # once it falls outside the suppression window -- not
-        # immediately, the way a confirmed failure is.
+    def test_partial_delivery_entry_is_never_reclaimed_by_age(self):
+        # Regression for Codex's finding: unlike "completed" (reclaimed
+        # once it falls outside the suppression window) or "failed"
+        # (reclaimed immediately), a "partial" entry must never become
+        # claimable again no matter how old it is. A standard SMTP
+        # client (or an intermediate MTA) is entitled to keep retrying a
+        # temporary failure indefinitely, and the proxy has no way to
+        # resend to only the refused subset -- so there is no age past
+        # which an identical retry would be safe to auto-forward again.
         self._reserve("fp-1", "attempt-1", window=3600)
         self.cache.mark_partial("fp-1", "attempt-1", prune_older_than_seconds=3600)
 
@@ -230,7 +235,25 @@ class ForwardedMessageDedupTests(unittest.TestCase):
         self._age_fingerprint("fp-1", seconds=7200)
         result = self._reserve("fp-1", "attempt-3", window=3600)
 
-        self.assertEqual(result.outcome, "claimed")
+        self.assertEqual(result.outcome, "partial")
+
+    def test_partial_delivery_entry_is_never_pruned_by_age(self):
+        # A pruning sweep (triggered by resolving some *other*
+        # fingerprint) must not delete an old "partial" row outright --
+        # doing so would make the next identical resubmission look like
+        # a brand new fingerprint and forward it again, which is exactly
+        # what the permanent block above exists to prevent.
+        self._reserve("fp-partial", "attempt-1", window=3600)
+        self.cache.mark_partial("fp-partial", "attempt-1", prune_older_than_seconds=3600)
+        self._age_fingerprint("fp-partial", seconds=7200)
+
+        # Resolving a different, unrelated fingerprint triggers a prune
+        # sweep over every row older than the window.
+        self._reserve("fp-other", "attempt-2", window=3600)
+        self.cache.mark_forwarded("fp-other", "attempt-2", prune_older_than_seconds=3600)
+
+        result = self._reserve("fp-partial", "attempt-3", window=3600)
+        self.assertEqual(result.outcome, "partial")
 
     def test_completed_entry_older_than_window_is_reclaimed(self):
         self._reserve("fp-1", "attempt-1", window=3600)

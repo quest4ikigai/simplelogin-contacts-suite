@@ -170,12 +170,17 @@ response to a submission depends on which:
   error or a second delivery.
 - **Forwarding partially accepted.** The upstream server confirmed-accepted
   *some* recipients and confirmed-refused the rest of the same matching
-  message (see "Partial recipient acceptance" below). Like "completed",
-  this is never automatically reforwarded -- the proxy has no way to
-  resend to only the refused subset, so the recipients already accepted
-  must never receive a second copy. A resubmission is deferred with `451`
-  and an `smtp_duplicate_partial_delivery` audit event, not reported as
-  outright success or forwarded again.
+  message (see "Partial recipient acceptance" below). Unlike every other
+  state, this is never reclaimed by age at all -- not after the
+  suppression window, and not by the background pruning that otherwise
+  bounds the table's size. The proxy has no way to resend to only the
+  refused subset, so the recipients already accepted must never receive
+  a second copy, and a standard SMTP client (or an intermediate MTA) is
+  entitled to keep retrying a temporary failure indefinitely, so no
+  elapsed time would ever make reforwarding safe. A resubmission is
+  rejected permanently with `550` and an `smtp_duplicate_partial_delivery`
+  audit event, not reported as outright success or deferred for a later
+  retry.
 - **Forwarding confirmed failed.** A matching attempt raised a confirmed
   `UpstreamForwardingError` -- one known to have occurred *before* any
   message data was sent (connection refused, EHLO/STARTTLS/AUTH failure)
@@ -233,24 +238,34 @@ proxy already replied `250 OK` to every `RCPT TO` when the client
 submitted the message, before it knew the full MIME content or had
 contacted the upstream server, so the only thing left to answer is the
 single reply to `DATA`. A plain `250` here would misreport the refused
-recipient as having received the message; a plain `550` would claim the
-*entire* submission failed even though most of it was delivered and
-would invite the sender to resend to everyone, duplicating the delivery
-to those who already got it. The proxy instead returns a temporary
-`451` whose text states the actual split -- `"451 Message delivered to
-N of M recipient(s); R recipient(s) were refused by the upstream mail
-server..."` -- and logs an `smtp_message_partially_forwarded` audit
-event with `accepted_count`, `refused_count`, the total `recipient_count`,
-and the upstream's numeric `refused_smtp_codes`. The dedup reservation is
-marked `partial` (see above), so even if the client or a human blindly
-resends the identical message, the proxy will not forward it again --
-the response to that resubmission says so explicitly.
+recipient as having received the message. A *temporary* (`4xx`) response
+was considered instead of a permanent one, specifically to avoid implying
+the entire submission failed when most of it was delivered -- but a `4xx`
+response is not just a politer word choice: it is an explicit, standard
+invitation for a compliant SMTP client or an intermediate relaying MTA to
+automatically retry the identical message later, with no action from the
+original sender at all. If duplicate suppression is disabled
+(`SMTP_PROXY_DUPLICATE_SUPPRESSION_WINDOW_SECONDS=0`) that retry would be
+forwarded again immediately; even with it enabled, a `4xx` paired with a
+reservation that eventually expired would just delay, not prevent, an
+automatic resend reaching the recipients who already got the message. So
+the proxy reports a *permanent* failure instead -- `550`, whose text
+states the actual split (`"550 Message delivered to N of M recipient(s);
+R recipient(s) were refused by the upstream mail server..."`) so a human
+reading the response still understands most of the message went through
+-- and logs an `smtp_message_partially_forwarded` audit event with
+`accepted_count`, `refused_count`, the total `recipient_count`, and the
+upstream's numeric `refused_smtp_codes`. The dedup reservation is marked
+`partial` and, uniquely among every outcome this proxy tracks, is *never*
+reclaimed automatically regardless of how much time passes (see above):
+even a blind resend of the identical message, today or a year from now,
+gets the same permanent `550` and is never forwarded again.
 
 Recovering from a partial acceptance is necessarily a manual step: the
 proxy has no mechanism to resend to only the refused recipient (SMTP
 submission here is all-or-nothing per message), and it does not attempt
 automatic recipient-level retries. Recipient addresses are deliberately
-never written to the normal audit log or the `451` response -- for
+never written to the normal audit log or the `550` response -- for
 addresses rewritten to a SimpleLogin reverse alias, the original sender
 could not identify the affected recipient from the raw refused address
 anyway, since that mapping is internal to the proxy and SimpleLogin. To
@@ -261,7 +276,9 @@ diagnostic path that is off by default and should be turned back off
 once the affected recipient has been identified. With that in hand, the
 operator (or the original sender, for recipients they typed themselves
 and who were not rewritten to a reverse alias) can send a new,
-standalone message to just that recipient.
+standalone message to just that recipient -- a fresh compose gets its
+own fingerprint and is unaffected by the permanent block on the original
+one.
 
 ### Leases, renewal, and recovering from a crash
 
@@ -307,7 +324,11 @@ The `forwarded_messages` SQLite table gained a `status` column (`pending`,
 change. Both are added with an additive, idempotent migration run on
 every connection, so an existing persistent `/data/cache.sqlite3` volume
 from an earlier
-version of this feature upgrades in place with no manual steps.
+version of this feature upgrades in place with no manual steps. Rows with
+status `partial` are never swept up by the opportunistic pruning that
+otherwise bounds this table's size (see above) -- they are expected to be
+rare, and an operator who resolves one by hand can delete its row
+manually if it needs to be reclaimed.
 
 ## Diagnostics and logging
 
@@ -339,8 +360,9 @@ of these terminal audit events -- none of them is ever silently skipped:
 - `smtp_duplicate_already_delivered`: a matching submission already
   completed; reported as success without forwarding again.
 - `smtp_duplicate_partial_delivery`: a matching submission already
-  partially delivered; deferred with `451` without forwarding again,
-  rather than being reported as either success or a fresh failure.
+  partially delivered; permanently rejected with `550` without
+  forwarding again, rather than being reported as either success or a
+  retryable failure.
 - `smtp_client_disconnected_during_processing`: the submitting client
   disconnected before a response could be sent, carrying the same
   `correlation_id` as whichever of the above events eventually resolves

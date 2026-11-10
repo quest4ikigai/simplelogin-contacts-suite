@@ -56,13 +56,17 @@ class ReservationResult:
         yet, but it is not a confirmed duplicate either.
       - "completed": the fingerprint was already forwarded successfully
         within the suppression window.
-      - "partial": the fingerprint was already forwarded within the
-        suppression window, but the upstream server confirmed-accepted
-        only some of the recipients and confirmed-refused the rest.
-        Treated like "completed" for reclaim purposes (not immediately
-        retryable, unlike "failed"): the proxy has no way to resend to
-        only the refused subset, so the accepted subset must never be
-        sent again.
+      - "partial": the upstream server confirmed-accepted only some of
+        the recipients and confirmed-refused the rest. Unlike every
+        other outcome, this is never automatically reclaimed by age: an
+        identical retry must never be allowed to redeliver to the
+        accepted subset, and a standard SMTP client (or an intermediate
+        MTA) is entitled to retry a temporary failure indefinitely, so
+        there is no time window after which that would become safe. The
+        proxy has no way to resend to only the refused subset, so a
+        "partial" fingerprint stays blocked until an operator resolves
+        it (see cache.py's forwarded_messages and the README's "Partial
+        recipient acceptance" section) or the row is manually removed.
     """
 
     outcome: str
@@ -364,7 +368,8 @@ class SQLiteAliasCache:
         (abandoned for long enough that the proxy gives up waiting and
         accepts the small residual risk of a duplicate -- see the
         "Delivery-state handling" section of the README for the documented
-        trade-off).
+        trade-off). A "partial" entry is never claimable by age, no matter
+        how old: see ReservationResult's "partial" outcome for why.
 
         suppression_window_seconds <= 0 disables dedup entirely: always
         returns "claimed" without touching the table.
@@ -390,14 +395,12 @@ class SQLiteAliasCache:
                 WHERE
                   forwarded_messages.status = 'failed'
                   OR (forwarded_messages.status = 'completed' AND forwarded_messages.forwarded_at < ?)
-                  OR (forwarded_messages.status = 'partial' AND forwarded_messages.forwarded_at < ?)
                   OR (forwarded_messages.status = 'pending' AND forwarded_messages.forwarded_at < ?)
                 """,
                 (
                     fingerprint,
                     now_iso,
                     attempt_id,
-                    completed_cutoff,
                     completed_cutoff,
                     abandoned_cutoff,
                 ),
@@ -421,6 +424,9 @@ class SQLiteAliasCache:
         if status == "completed":
             return ReservationResult(outcome="completed", prior_attempt_id=prior_attempt_id)
         if status == "partial":
+            # Deliberately not matched by the WHERE clause above at any
+            # age: a "partial" fingerprint is permanently blocked from
+            # automatic reclaim (see ReservationResult's docstring).
             return ReservationResult(outcome="partial", prior_attempt_id=prior_attempt_id)
 
         age_seconds = None
@@ -503,11 +509,13 @@ class SQLiteAliasCache:
         """Mark this attempt's reservation as a confirmed partial delivery.
 
         Some recipients were confirmed accepted by the upstream server
-        and some were confirmed refused. Treated like a completed send
-        for reclaim purposes, not like a failure: the proxy has no way
-        to resend to only the refused subset, so an identical retry must
-        never be allowed to redeliver to the recipients already accepted
-        -- see try_reserve_forwarding.
+        and some were confirmed refused. Unlike every other resolution,
+        this is never time-reclaimable and never pruned by age (see
+        try_reserve_forwarding and _resolve_reservation): the proxy has
+        no way to resend to only the refused subset, and a standard SMTP
+        client is entitled to retry a temporary failure indefinitely, so
+        no amount of elapsed time makes it safe to let an identical
+        retry redeliver to the recipients already accepted.
         """
         self._resolve_reservation(fingerprint, attempt_id, "partial", prune_older_than_seconds)
 
@@ -521,8 +529,17 @@ class SQLiteAliasCache:
         now_dt = datetime.now(timezone.utc)
         cutoff = (now_dt - timedelta(seconds=prune_older_than_seconds)).isoformat()
         with self.connect() as conn:
+            # "partial" rows are excluded here, not just from
+            # try_reserve_forwarding's time-based reclaim: pruning one
+            # would delete the row outright, which would make the next
+            # identical resubmission look like a fresh fingerprint and
+            # forward it again, exactly what the "partial" outcome's
+            # permanent block exists to prevent.
             conn.execute(
-                "DELETE FROM forwarded_messages WHERE forwarded_at < ? AND fingerprint != ?",
+                """
+                DELETE FROM forwarded_messages
+                WHERE forwarded_at < ? AND fingerprint != ? AND status != 'partial'
+                """,
                 (cutoff, fingerprint),
             )
             conn.execute(
