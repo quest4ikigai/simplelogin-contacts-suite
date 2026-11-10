@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 from collections import Counter
 from email import policy
@@ -20,7 +21,7 @@ from alias_routing_core import (
 from simplelogin_client import RequestStats
 
 from .config import SmtpProxyConfig
-from .reverse_alias_resolver import ResolutionStats
+from .reverse_alias_resolver import ResolutionStats, ReverseAliasResolver
 
 
 LOGGER = logging.getLogger(__name__)
@@ -185,13 +186,29 @@ def build_plan_for_message(
         resolution_stats,
     )
 
+    # alias_routing_core's planner calls reverse_alias_resolver with
+    # exactly two positional arguments (recipient, selected_alias); it
+    # has no notion of RequestStats. Only our own ReverseAliasResolver
+    # accepts a request_stats keyword at all -- a duck-typed or injected
+    # resolver (as used in tests and custom deployments) keeps its
+    # original two-argument contract -- so bind it via partial rather
+    # than changing the call site's arity, exactly like the
+    # owned_alias_emails call above in smtp_server.py. Without this, a
+    # bulk list_contacts() failure falling back to this per-recipient
+    # path would issue real SimpleLogin API requests that smtp_transform_plan's
+    # simplelogin_request_count/simplelogin_request_duration_ms audit
+    # fields never counted.
+    resolver_for_plan = reverse_alias_resolver
+    if isinstance(reverse_alias_resolver, ReverseAliasResolver):
+        resolver_for_plan = functools.partial(reverse_alias_resolver, request_stats=request_stats)
+
     plan = build_transform_plan(
         recipients,
         config.routing_context(extra_simplelogin_aliases=extra_simplelogin_aliases),
         header_alias=header_alias,
         alias_selector_recipients=alias_selectors,
         cover_recipient_candidates=cover_recipient_candidates,
-        reverse_alias_resolver=reverse_alias_resolver,
+        reverse_alias_resolver=resolver_for_plan,
     )
     return message, plan
 

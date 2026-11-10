@@ -28,15 +28,18 @@ class FakeSimpleLoginClient:
         self.fail = fail
         self.list_aliases_calls = 0
         self.get_or_create_calls = []
+        self.last_stats = None
 
     def list_aliases(self, stats=None):
         self.list_aliases_calls += 1
+        self.last_stats = stats
         if self.fail:
             raise SimpleLoginApiError("SimpleLogin API unavailable")
         return self.aliases
 
     def get_or_create_contact(self, alias_id, contact, stats=None):
         self.get_or_create_calls.append((alias_id, contact))
+        self.last_stats = stats
         if self.fail:
             raise SimpleLoginApiError("SimpleLogin API unavailable")
         existing = self.contacts.get((alias_id, contact.casefold()))
@@ -336,6 +339,34 @@ class ReverseAliasResolverTests(unittest.TestCase):
             self.cache.find_reverse_alias("123", "alice@example.com"),
             "reply+alice@simplelogin.co",
         )
+
+    def test_call_forwards_request_stats_to_get_or_create_contact(self):
+        # Regression for Codex's finding: when build_transform_plan's
+        # planner falls back to this per-recipient path (e.g. after a
+        # bulk list_contacts() failure), its SimpleLogin API request
+        # must still be counted in the submission's RequestStats --
+        # otherwise smtp_transform_plan's request-count/duration audit
+        # fields silently undercount exactly the N+1 behavior they
+        # exist to expose.
+        client = FakeSimpleLoginClient(
+            aliases=[Alias(id="123", email="shopping@example.com")],
+            created_contact=AliasContact(
+                id="789",
+                alias_id="123",
+                contact="Alice <alice@example.com>",
+                reverse_alias=None,
+                reverse_alias_address="reply+alice@simplelogin.co",
+            ),
+        )
+        resolver = ReverseAliasResolver(self.config, cache=self.cache, client=client)
+        stats = RequestStats()
+
+        reverse_alias = resolver(
+            "Alice <alice@example.com>", "shopping@example.com", request_stats=stats
+        )
+
+        self.assertEqual(reverse_alias, "reply+alice@simplelogin.co")
+        self.assertIs(client.last_stats, stats)
 
     def test_owned_alias_emails_refreshes_from_simplelogin(self):
         client = FakeSimpleLoginClient(

@@ -45,8 +45,13 @@ class ReverseAliasResolver:
         self.cache = cache or SQLiteAliasCache(config.cache_path)
         self.client = client or _client_from_config(config)
 
-    def __call__(self, recipient: str, selected_alias: str) -> Optional[str]:
-        alias_id = self._alias_id_for_email(selected_alias)
+    def __call__(
+        self,
+        recipient: str,
+        selected_alias: str,
+        request_stats: Optional[RequestStats] = None,
+    ) -> Optional[str]:
+        alias_id = self._alias_id_for_email(selected_alias, request_stats=request_stats)
         contact_email = _contact_email(recipient)
 
         cached = self.cache.find_contact(alias_id, contact_email)
@@ -60,7 +65,7 @@ class ReverseAliasResolver:
                 raise ReverseAliasResolutionError("reverse alias contact is blocked")
             return reverse_alias_address
 
-        contact = self.client.get_or_create_contact(alias_id, recipient)
+        contact = self.client.get_or_create_contact(alias_id, recipient, stats=request_stats)
         self._cache_contact(contact, alias_id, contact_email)
         if contact.block_forward:
             raise ReverseAliasResolutionError("reverse alias contact is blocked")

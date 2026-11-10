@@ -1,7 +1,9 @@
 import os
 import sys
+import tempfile
 import unittest
 from email.message import EmailMessage
+from unittest import mock
 
 APP_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 CORE_SRC = os.path.join(os.path.dirname(__file__), "..", "..", "..", "packages", "alias-routing-core", "src")
@@ -10,6 +12,7 @@ sys.path.insert(0, os.path.abspath(APP_SRC))
 sys.path.insert(0, os.path.abspath(CORE_SRC))
 sys.path.insert(0, os.path.abspath(SIMPLELOGIN_SRC))
 
+from simplelogin_client import RequestStats
 from sl_smtp_proxy.config import SmtpProxyConfig
 from alias_routing_core import (
     RecipientClassification,
@@ -23,6 +26,7 @@ from sl_smtp_proxy.message_transform import (
     collect_alias_selector_recipients,
     transformed_envelope_recipients,
 )
+from sl_smtp_proxy.reverse_alias_resolver import ReverseAliasResolver
 
 
 class MessageTransformTests(unittest.TestCase):
@@ -319,6 +323,57 @@ class MessageTransformTests(unittest.TestCase):
         kept = [item for item in plan.actions if item.original == "external@example.net"]
         self.assertEqual(len(kept), 1)
         self.assertEqual(kept[0].action, TransformAction.KEEP)
+
+    def test_bulk_prefetch_failure_fallback_forwards_request_stats(self):
+        # Regression for Codex's finding: when the bulk list_contacts()
+        # call fails, resolve_bulk() leaves the recipient uncached and
+        # build_transform_plan's planner falls back to calling the real
+        # ReverseAliasResolver once per recipient instead. That fallback
+        # call must still receive this submission's RequestStats --
+        # otherwise smtp_transform_plan's simplelogin_request_count/
+        # simplelogin_request_duration_ms audit fields silently miss
+        # exactly the N+1 SimpleLogin traffic they exist to expose.
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        cfg = SmtpProxyConfig(
+            require_auth=False,
+            cache_path=os.path.join(tmpdir.name, "cache.sqlite3"),
+            simplelogin_api_key="test-key",
+        )
+        resolver = ReverseAliasResolver(cfg)
+        resolver.cache.upsert_alias("alias-1", "shopping@example.com", "", True)
+        resolver.client.list_contacts = mock.MagicMock(side_effect=RuntimeError("rate limited"))
+        resolver.client.get_or_create_contact = mock.MagicMock(
+            return_value=mock.MagicMock(
+                id="c1",
+                alias_id="alias-1",
+                contact="Alice <alice@example.com>",
+                reverse_alias_address="reply+alice@simplelogin.co",
+                block_forward=False,
+            )
+        )
+
+        msg = EmailMessage()
+        msg["From"] = "sender@example.com"
+        msg["To"] = "alice@example.com"
+        msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+        msg.set_content("hello")
+
+        stats = RequestStats()
+        _, plan = build_plan_for_message(
+            "sender@example.com",
+            ["alice@example.com"],
+            msg.as_bytes(),
+            cfg,
+            reverse_alias_resolver=resolver,
+            request_stats=stats,
+        )
+
+        resolver.client.get_or_create_contact.assert_called_once()
+        self.assertIs(
+            resolver.client.get_or_create_contact.call_args.kwargs.get("stats"), stats
+        )
+        self.assertEqual(transformed_envelope_recipients(plan), ["reply+alice@simplelogin.co"])
 
 
 if __name__ == "__main__":
