@@ -433,36 +433,31 @@ class SmtpProxyHandler:
                 )
                 return "550 SimpleLogin SMTP proxy dry-run: message not forwarded"
 
-            phase = "duplicate_check"
-            fingerprint = None
-            if self.config.duplicate_suppression_window_seconds > 0:
-                fingerprint = _forward_fingerprint(
-                    envelope.mail_from or "", transformed_recipients, transformed_message
-                )
-
-            # From here on, claiming the duplicate-reservation and (if
-            # claimed) actually forwarding run as a single independent,
-            # shielded task: if the client disconnects while this is in
-            # flight, handle_DATA's own await is cancelled (as it must be,
-            # so the connection teardown proceeds normally), but the task
-            # keeps running to completion and always logs its real
-            # outcome. This must cover the reservation claim too, not just
-            # the network forward: claiming it is itself an off-event-loop
-            # write (see _dedup_executor below), so without this, a
-            # disconnect landing in that narrow window could leave a
-            # 'pending' reservation that nothing would ever resolve, and a
-            # message that was never forwarded and never retried until its
-            # lease and abandoned-grace period both elapsed. An upstream
-            # send already accepted by Proton Bridge is, as before, never
-            # silently dropped on the floor just because nobody is left to
-            # read the SMTP response.
+            # From here on, computing the fingerprint, claiming the
+            # duplicate-reservation, and (if claimed) actually forwarding
+            # all run as a single independent, shielded task: if the
+            # client disconnects while this is in flight, handle_DATA's
+            # own await is cancelled (as it must be, so the connection
+            # teardown proceeds normally), but the task keeps running to
+            # completion and always logs its real outcome. This must
+            # cover the fingerprint computation and the reservation claim
+            # too, not just the network forward -- both are themselves
+            # off-event-loop work (see _dedup_executor below), so without
+            # this, a disconnect landing in either of those narrow
+            # windows could abandon a message before a reservation was
+            # even attempted, or leave a 'pending' reservation that
+            # nothing would ever resolve, and a message that was never
+            # forwarded and never retried until its lease and
+            # abandoned-grace period both elapsed. An upstream send
+            # already accepted by Proton Bridge is, as before, never
+            # silently dropped on the floor just because nobody is left
+            # to read the SMTP response.
             phase = "forwarding"
             forward_started = time.monotonic()
             outcome_task = asyncio.ensure_future(
                 self._claim_duplicate_and_forward(
                     correlation_id=correlation_id,
                     peer=peer,
-                    fingerprint=fingerprint,
                     sender=envelope.mail_from or "",
                     recipients=transformed_recipients,
                     message=transformed_message,
@@ -514,21 +509,35 @@ class SmtpProxyHandler:
         self,
         correlation_id: str,
         peer: str,
-        fingerprint: Optional[str],
         sender: str,
         recipients,
         message: Message,
         started: float,
     ) -> str:
-        """Claim the duplicate-suppression reservation, if enabled, and
-        dispatch to actual forwarding if and only if it was claimed.
+        """Compute the fingerprint and claim the duplicate-suppression
+        reservation, if enabled, then dispatch to actual forwarding if
+        and only if it was claimed.
 
         Called as a single shielded task from handle_DATA so that a
-        client disconnect can never land in between "reservation claimed"
-        and "forwarding started" -- see the comment at that call site.
+        client disconnect can never land in between "fingerprint
+        computed", "reservation claimed", and "forwarding started" --
+        see the comment at that call site.
         """
+        loop = asyncio.get_running_loop()
+        fingerprint: Optional[str] = None
+        if self.config.duplicate_suppression_window_seconds > 0:
+            # Serializing the full (possibly near-max_message_bytes)
+            # message and hashing it is real, synchronous CPU work --
+            # run it off the event loop like every other blocking
+            # submission stage, not inline, or a large message (or
+            # several concurrent ones) stalls every other connection
+            # and health probe for as long as it takes.
+            fingerprint = await loop.run_in_executor(
+                self._dedup_executor,
+                functools.partial(_forward_fingerprint, sender, recipients, message),
+            )
+
         if fingerprint:
-            loop = asyncio.get_running_loop()
             try:
                 # Atomically claim the fingerprint here, before forwarding,
                 # rather than just checking it: a client that disconnects

@@ -2671,6 +2671,67 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             await proxy.stop()
             upstream.stop(no_assert=True)
 
+    async def test_server_remains_responsive_while_fingerprinting_a_large_message(self):
+        # Regression for Codex's finding: computing the duplicate-
+        # suppression fingerprint serializes the full (possibly
+        # near-SMTP_PROXY_MAX_MESSAGE_BYTES) message and hashes it.
+        # That is real, synchronous CPU work; it must run off the event
+        # loop like every other blocking submission stage, not inline
+        # in handle_DATA, or a large message (or several concurrent
+        # ones) stalls every other connection and health probe for as
+        # long as it takes.
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_fingerprint(sender, recipients, message):
+            started.set()
+            release.wait(timeout=10)
+            return _forward_fingerprint(sender, recipients, message)
+
+        proxy = SmtpProxyServer(
+            local_smtp_config(host="127.0.0.1", port=0, require_auth=False, dry_run=False),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+            forwarder=AlwaysSucceedsForwarder(),
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            loop = asyncio.get_running_loop()
+            with mock.patch(
+                "sl_smtp_proxy.smtp_server._forward_fingerprint",
+                side_effect=blocking_fingerprint,
+            ):
+                slow_send = loop.run_in_executor(
+                    None, submit_message, proxy.port, msg, ["alice@example.com"]
+                )
+
+                started_ok = await loop.run_in_executor(None, started.wait, 2.0)
+                self.assertTrue(started_ok, "fingerprint computation never started")
+
+                # While that first submission is stuck fingerprinting, a
+                # brand-new connection/health probe must still be served
+                # promptly -- proving the event loop itself was never
+                # blocked.
+                probe_config = SmtpProxyConfig(
+                    host="127.0.0.1", port=proxy.port, require_auth=False
+                )
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, check_health, probe_config, 2.0),
+                    timeout=3.0,
+                )
+
+                release.set()
+                result = await asyncio.wait_for(slow_send, timeout=5.0)
+                self.assertEqual(result[0], 250)
+        finally:
+            release.set()
+            await proxy.stop()
+
     async def test_client_disconnect_during_resolution_does_not_forward(self):
         blocking_resolver = BlockingResolver()
         upstream_handler = CaptureUpstreamHandler()
@@ -2837,6 +2898,101 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             blocking_forwarder.release.set()
+            await proxy.stop()
+            upstream.stop(no_assert=True)
+
+    async def test_client_disconnect_during_fingerprint_computation_does_not_abandon_message(
+        self,
+    ):
+        # Regression for a race introduced while fixing Codex's finding
+        # that fingerprinting blocked the event loop: offloading that
+        # computation to a worker thread made it an await point, and if
+        # that await happened in handle_DATA's own body -- before the
+        # shielded _claim_duplicate_and_forward task is even created --
+        # a client disconnect landing during it would cancel handle_DATA
+        # and abandon the message entirely, never reaching the
+        # reservation claim or forward() at all. The fingerprint
+        # computation must happen *inside* the shielded task, exactly
+        # like the reservation claim and the network forward, so a
+        # disconnect here is no different from a disconnect during
+        # forwarding: the task keeps running and still delivers the
+        # message.
+        upstream_handler = CaptureUpstreamHandler()
+        upstream_port = free_port()
+        upstream = Controller(
+            upstream_handler,
+            hostname="127.0.0.1",
+            port=upstream_port,
+            decode_data=False,
+            ready_timeout=5.0,
+        )
+        upstream.start()
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_fingerprint(sender, recipients, message):
+            started.set()
+            release.wait(timeout=10)
+            return _forward_fingerprint(sender, recipients, message)
+
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_host="127.0.0.1",
+                upstream_port=upstream_port,
+            ),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            loop = asyncio.get_running_loop()
+            with self.assertLogs("sl_smtp_proxy.smtp_server", level="INFO") as captured:
+                with mock.patch(
+                    "sl_smtp_proxy.smtp_server._forward_fingerprint",
+                    side_effect=blocking_fingerprint,
+                ):
+                    disconnecting_send = loop.run_in_executor(
+                        None,
+                        submit_message_and_disconnect,
+                        proxy.port,
+                        msg,
+                        ["alice@example.com"],
+                    )
+
+                    started_ok = await loop.run_in_executor(None, started.wait, 2.0)
+                    self.assertTrue(started_ok, "fingerprint computation never started")
+                    await asyncio.wait_for(disconnecting_send, timeout=3.0)
+
+                    # The client is gone, but the in-flight fingerprint
+                    # computation -- and the reservation claim and
+                    # forward downstream of it -- must not be abandoned.
+                    release.set()
+
+                    def _forwarded_logged():
+                        return any(
+                            '"event":"smtp_message_forwarded"' in line
+                            for line in captured.output
+                        )
+
+                    self.assertTrue(
+                        await _wait_until_async(_forwarded_logged, timeout=3.0),
+                        "expected a definitive smtp_message_forwarded audit event "
+                        "after disconnect",
+                    )
+
+            self.assertEqual(len(upstream_handler.messages), 1)
+        finally:
+            release.set()
             await proxy.stop()
             upstream.stop(no_assert=True)
 
