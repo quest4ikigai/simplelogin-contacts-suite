@@ -130,6 +130,20 @@ Raise it if legitimate concurrent load routinely hits the default of 20;
 lower it (or lower `SMTP_PROXY_MAX_MESSAGE_BYTES`) to trade throughput for
 a smaller worst-case memory ceiling.
 
+A submission holds its slot for as long as its underlying work is
+genuinely still in progress, not merely for as long as the submitting
+client stays connected: once forwarding begins, claiming the fingerprint
+reservation and the network forward both run as a single shielded task
+(see "Delivery-state handling" below) specifically so a client
+disconnect does not abandon them, and the slot is transferred to that
+same task rather than released when the client goes away. Releasing it
+on disconnect instead would have reopened exactly the resource-exhaustion
+path this setting exists to close: a client could submit a unique
+message and disconnect immediately, over and over, freeing a slot again
+within milliseconds each time while the actual background work (and the
+memory each instance of it holds) piled up unbounded regardless of the
+configured limit.
+
 The duplicate-suppression cache (below) gets its own small, fixed-size
 worker pool for the same reason resolution and forwarding do: SQLite can
 block a caller behind its own busy-timeout if the database file is

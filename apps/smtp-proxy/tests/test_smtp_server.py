@@ -2794,6 +2794,82 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             blocking_resolver.release.set()
             await proxy.stop()
 
+    async def test_capacity_slot_is_held_until_shielded_forward_finishes_despite_disconnect(
+        self,
+    ):
+        # Security review finding: the admission slot was released
+        # whenever handle_DATA's own coroutine exited -- including by
+        # cancellation from a client disconnect -- even though the
+        # shielded _claim_duplicate_and_forward task (by design, via
+        # asyncio.shield) keeps running independently, still holding
+        # the full transformed message in memory. A client could
+        # submit a unique message and disconnect immediately, over and
+        # over, freeing the slot again within milliseconds each time
+        # while the actual background work piled up unbounded --
+        # defeating the whole point of max_concurrent_submissions. The
+        # slot must stay held for as long as that task is genuinely
+        # still running, not just for as long as the client stays
+        # connected.
+        blocking_forwarder = BlockingForwarder(AlwaysSucceedsForwarder())
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                max_concurrent_submissions=1,
+            ),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+            forwarder=blocking_forwarder,
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["Message-Id"] = "<capacity-slot-disconnect@example.com>"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, submit_message_and_disconnect, proxy.port, msg, ["alice@example.com"]
+            )
+            started = await loop.run_in_executor(None, blocking_forwarder.started.wait, 2.0)
+            self.assertTrue(started, "forward() never started")
+
+            # The submitting client is gone, but the shielded task is
+            # still running: the single admission slot must still be
+            # held, not released just because the client disconnected.
+            self.assertEqual(proxy.handler._in_flight_submissions, 1)
+
+            second_msg = EmailMessage()
+            second_msg["From"] = "sender@example.com"
+            second_msg["To"] = "bob@example.com"
+            second_msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            second_msg.set_content("a second, unrelated message")
+            second_result = await loop.run_in_executor(
+                None, submit_message, proxy.port, second_msg, ["bob@example.com"]
+            )
+            self.assertEqual(second_result[0], 451)
+            self.assertIn("capacity", second_result[1].lower())
+
+            blocking_forwarder.release.set()
+            completed = await loop.run_in_executor(None, blocking_forwarder.completed.wait, 3.0)
+            self.assertTrue(completed, "forward() never completed after being released")
+
+            # The task's own done-callback releases the slot; give it a
+            # moment to actually run.
+            self.assertTrue(
+                await _wait_until_async(
+                    lambda: proxy.handler._in_flight_submissions == 0, timeout=2.0
+                ),
+                "capacity slot was never released once the shielded task finished",
+            )
+        finally:
+            blocking_forwarder.release.set()
+            await proxy.stop()
+
     async def test_server_remains_responsive_while_recipient_resolution_is_blocked(self):
         blocking_resolver = BlockingResolver()
         proxy = SmtpProxyServer(

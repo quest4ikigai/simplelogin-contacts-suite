@@ -86,6 +86,45 @@ _AT_CAPACITY_RESPONSE = (
 )
 
 
+class _CapacitySlot:
+    """Owns exactly one max_concurrent_submissions slot and guarantees
+    it is released exactly once, by whichever of two different owners
+    actually ends up holding it last.
+
+    A client disconnect cancels handle_DATA's own await, but (by
+    design, via asyncio.shield) does not cancel the shielded
+    _claim_duplicate_and_forward task -- that task keeps running, still
+    holding the full transformed message in memory, until it finishes
+    on its own. If the slot were released whenever handle_DATA's own
+    coroutine exits -- including by cancellation -- a client could
+    submit a unique message and disconnect immediately, over and over,
+    freeing the slot again within milliseconds each time while the
+    actual background work keeps piling up unbounded: the exact
+    resource-exhaustion path max_concurrent_submissions exists to
+    close. transfer_to_task() moves ownership to the task itself before
+    it is ever awaited, so the slot stays held for as long as that
+    task is genuinely still running, however long handle_DATA's own
+    processing already took or however it ends.
+    """
+
+    __slots__ = ("_handler", "_transferred")
+
+    def __init__(self, handler: "SmtpProxyHandler"):
+        self._handler = handler
+        self._transferred = False
+
+    def transfer_to_task(self, task: "asyncio.Task") -> None:
+        self._transferred = True
+        task.add_done_callback(self._release)
+
+    def release_if_not_transferred(self) -> None:
+        if not self._transferred:
+            self._handler._in_flight_submissions -= 1
+
+    def _release(self, _task: "asyncio.Task" = None) -> None:
+        self._handler._in_flight_submissions -= 1
+
+
 def _swallow_task_exception(task: "asyncio.Task") -> None:
     # Safety net for the shielded forwarding task: if the client
     # disconnects, handle_DATA stops awaiting this task (though it keeps
@@ -355,12 +394,19 @@ class SmtpProxyHandler:
             # bound.
             return self._reject_for_capacity(peer, correlation_id)
         self._in_flight_submissions += 1
+        slot = _CapacitySlot(self)
         try:
-            return await self._process_data(correlation_id, peer, envelope)
+            return await self._process_data(correlation_id, peer, envelope, slot)
         finally:
-            self._in_flight_submissions -= 1
+            # No-op if the submission reached the shielded forwarding
+            # task below: that task owns the slot from then on,
+            # regardless of whether (or how) this await itself ends --
+            # see _CapacitySlot's docstring.
+            slot.release_if_not_transferred()
 
-    async def _process_data(self, correlation_id: str, peer: str, envelope) -> str:
+    async def _process_data(
+        self, correlation_id: str, peer: str, envelope, slot: "_CapacitySlot"
+    ) -> str:
         loop = asyncio.get_running_loop()
         started = time.monotonic()
         phase = "parsing"
@@ -584,6 +630,12 @@ class SmtpProxyHandler:
             self._pending_forward_tasks.add(outcome_task)
             outcome_task.add_done_callback(self._pending_forward_tasks.discard)
             outcome_task.add_done_callback(_swallow_task_exception)
+            # From here on, the capacity slot belongs to outcome_task,
+            # not to this coroutine: a client disconnect cancels only
+            # the await below, never the shielded task itself, and the
+            # slot must stay held for as long as that task is actually
+            # still running -- see _CapacitySlot's docstring.
+            slot.transfer_to_task(outcome_task)
             try:
                 return await asyncio.shield(outcome_task)
             except UpstreamForwardingError as exc:
