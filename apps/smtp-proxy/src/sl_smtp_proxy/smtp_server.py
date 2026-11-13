@@ -78,6 +78,11 @@ def _forward_fingerprint(sender: str, recipients: Sequence[str], message: Messag
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+_SHUTTING_DOWN_RESPONSE = (
+    "451 SimpleLogin SMTP proxy is shutting down; please retry this message later"
+)
+
+
 def _swallow_task_exception(task: "asyncio.Task") -> None:
     # Safety net for the shielded forwarding task: if the client
     # disconnects, handle_DATA stops awaiting this task (though it keeps
@@ -178,6 +183,13 @@ class SmtpProxyHandler:
             thread_name_prefix="sl-dedup",
         )
         self._closed = False
+        # Set by begin_shutdown() before draining, so no new message can
+        # reach forwarding once a graceful shutdown has started -- see
+        # that method and handle_DATA's check below. Reset here too so a
+        # restarted server (reopen(), below) accepts new work again.
+        # Like _pending_forward_tasks, only ever read or written from
+        # the aiosmtpd controller's own event loop thread.
+        self._shutting_down = False
 
     def reopen(self) -> None:
         """Recreate the worker pools if a previous close() shut them down.
@@ -195,6 +207,33 @@ class SmtpProxyHandler:
         self._forward_executor.shutdown(wait=False)
         self._dedup_executor.shutdown(wait=False)
         self._closed = True
+
+    async def begin_shutdown(self, controller_loop: asyncio.AbstractEventLoop) -> None:
+        """Stop accepting new forwarding work, before anything is drained.
+
+        Must complete -- and therefore must run on controller_loop,
+        strictly before drain_pending_forwards's snapshot runs there --
+        or a new submission could still reach handle_DATA's forwarding
+        stage in the gap between starting the drain and actually
+        stopping the controller, creating an untracked task the drain's
+        snapshot never saw. Bridged via run_coroutine_threadsafe/
+        wrap_future for the same cross-thread reason as
+        drain_pending_forwards; see SmtpProxyServer.stop() for the
+        required ordering of the two calls.
+
+        Once this returns, every handle_DATA invocation still in
+        flight -- for a brand-new connection that raced in, or an
+        already-established session sending a second message -- sees
+        _shutting_down and answers with a temporary rejection instead
+        of creating a forwarding task, however far along it already is
+        in resolution/transform.
+        """
+
+        async def _set_flag():
+            self._shutting_down = True
+
+        future = asyncio.run_coroutine_threadsafe(_set_flag(), controller_loop)
+        await asyncio.wrap_future(future)
 
     async def drain_pending_forwards(self, controller_loop: asyncio.AbstractEventLoop) -> None:
         """Best-effort wait for in-flight shielded forwards before shutdown.
@@ -241,6 +280,19 @@ class SmtpProxyHandler:
                 drain_timeout,
             )
 
+    def _reject_for_shutdown(self, peer: str, correlation_id: str) -> str:
+        LOGGER.info(
+            "audit %s",
+            audit_event(
+                "smtp_message_rejected",
+                peer=peer,
+                correlation_id=correlation_id,
+                policy="server_shutting_down",
+                reason="SimpleLogin SMTP proxy is shutting down",
+            ),
+        )
+        return _SHUTTING_DOWN_RESPONSE
+
     async def handle_MAIL(self, server, session, envelope, address, mail_options) -> str:
         if not _sender_allowed(self.config, address):
             LOGGER.info(
@@ -260,6 +312,14 @@ class SmtpProxyHandler:
     async def handle_DATA(self, server, session, envelope) -> str:
         correlation_id = _new_correlation_id()
         peer = _peer_host(session)
+        if self._shutting_down:
+            # Cheap early exit: avoids wasted SimpleLogin API calls for a
+            # submission that will be rejected anyway. Not itself the
+            # race-closing check -- see the one immediately before
+            # creating the forwarding task below, which is what actually
+            # guarantees no untracked task is created once a shutdown's
+            # drain has started.
+            return self._reject_for_shutdown(peer, correlation_id)
         loop = asyncio.get_running_loop()
         started = time.monotonic()
         phase = "parsing"
@@ -452,6 +512,22 @@ class SmtpProxyHandler:
             # already accepted by Proton Bridge is, as before, never
             # silently dropped on the floor just because nobody is left
             # to read the SMTP response.
+            #
+            # The _shutting_down check right here -- immediately before
+            # creating the task, with no await in between -- is what
+            # actually closes the shutdown-drain race: begin_shutdown()
+            # and this check both run on this same event loop, so this
+            # check-then-create sequence can never straddle the moment
+            # the flag flips. Either this task is created and registered
+            # before begin_shutdown()'s flag flip (in which case
+            # drain_pending_forwards's later snapshot is guaranteed to
+            # include it), or this check already sees the flag set and
+            # no task is created at all -- there is no window where a
+            # task could be created *after* the flag flips but *before*
+            # the drain's snapshot, which is exactly the race Codex's
+            # review flagged against the first version of this fix.
+            if self._shutting_down:
+                return self._reject_for_shutdown(peer, correlation_id)
             phase = "forwarding"
             forward_started = time.monotonic()
             outcome_task = asyncio.ensure_future(
@@ -968,10 +1044,18 @@ class SmtpProxyServer:
 
     async def stop(self) -> None:
         if self._controller is not None:
-            # Must happen before controller.stop(): that call cancels
-            # every task on the controller's own loop directly, which
-            # would cut off an in-flight shielded forward before it can
-            # record its outcome. See drain_pending_forwards's docstring.
+            # Strict order matters here. begin_shutdown() must complete
+            # before drain_pending_forwards() takes its snapshot. Without
+            # that order, a new submission could still reach handle_DATA's
+            # forwarding stage in the gap between starting the drain and
+            # actually stopping the controller, creating a task the
+            # drain's snapshot never saw -- the race Codex's review found
+            # in the first version of this fix. And drain_pending_forwards
+            # must in turn happen before controller.stop(): that call
+            # cancels every task on the controller's own loop directly,
+            # which would cut off an in-flight shielded forward before it
+            # can record its outcome. See both methods' docstrings.
+            await self.handler.begin_shutdown(self._controller.loop)
             await self.handler.drain_pending_forwards(self._controller.loop)
         self.handler.close()
         if not self._controller:

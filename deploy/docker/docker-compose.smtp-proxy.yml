@@ -6,6 +6,21 @@ services:
     container_name: simplelogin-smtp-proxy
     restart: unless-stopped
     env_file: .env
+    # Docker sends SIGTERM on `docker stop`/`compose down`/a container
+    # replacement, waits up to stop_grace_period for the process to exit
+    # on its own, then sends SIGKILL (which cannot be caught -- any
+    # forward still in flight at that point is cut off with no chance to
+    # record its outcome, same as a crash; see the README's "Leases,
+    # renewal, and recovering from a crash" section). The proxy's own
+    # shutdown sequence waits up to
+    # UPSTREAM_SMTP_TIMEOUT_SECONDS + 5 seconds (35s at the documented
+    # default of 30s) for an in-flight forward to finish before
+    # proceeding, plus a small, normally sub-second amount of overhead to
+    # stop accepting new work and tear down the SMTP controller and its
+    # worker pools. 45s covers the default with margin; if
+    # UPSTREAM_SMTP_TIMEOUT_SECONDS is raised, increase this by the same
+    # amount (roughly UPSTREAM_SMTP_TIMEOUT_SECONDS + 15).
+    stop_grace_period: 45s
     ports:
       - "2525:2525"
     volumes:

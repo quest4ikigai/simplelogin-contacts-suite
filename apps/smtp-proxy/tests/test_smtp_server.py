@@ -1584,6 +1584,131 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             except Exception:
                 pass
 
+    async def test_stop_rejects_new_submission_that_arrives_during_drain(self):
+        # Regression for Codex's finding: drain_pending_forwards() takes
+        # a snapshot of currently in-flight tasks and waits only for
+        # those. A new submission reaching the forwarding stage *after*
+        # that snapshot but *before* the controller is actually
+        # stopped would create a task the snapshot never saw -- which
+        # controller.stop() would then cancel without ever recording
+        # its outcome, reopening exactly the race this whole feature
+        # exists to close. stop() now calls begin_shutdown() first (see
+        # its docstring), so a submission arriving during the drain
+        # must be rejected instead of ever reaching that point.
+        forwarder = AlwaysSucceedsForwarder()
+        blocking_forwarder = BlockingForwarder(forwarder)
+        proxy = SmtpProxyServer(
+            local_smtp_config(host="127.0.0.1", port=0, require_auth=False, dry_run=False),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+            forwarder=blocking_forwarder,
+        )
+        await proxy.start()
+
+        msg = EmailMessage()
+        msg["From"] = "sender@example.com"
+        msg["To"] = "alice@example.com"
+        msg["Message-Id"] = "<drain-race-original@example.com>"
+        msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+        msg.set_content("classroom announcement")
+
+        loop = asyncio.get_running_loop()
+        send_future = loop.run_in_executor(
+            None, submit_message, proxy.port, msg, ["alice@example.com"]
+        )
+        stop_task = None
+        try:
+            started = await loop.run_in_executor(None, blocking_forwarder.started.wait, 2.0)
+            self.assertTrue(started, "forward() never started")
+
+            stop_task = asyncio.ensure_future(proxy.stop())
+            await asyncio.sleep(0.1)
+
+            new_msg = EmailMessage()
+            new_msg["From"] = "sender@example.com"
+            new_msg["To"] = "bob@example.com"
+            new_msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            new_msg.set_content("a second, unrelated message")
+            new_result = await loop.run_in_executor(
+                None, submit_message, proxy.port, new_msg, ["bob@example.com"]
+            )
+            self.assertEqual(new_result[0], 451)
+            self.assertIn("shutting down", new_result[1].lower())
+
+            blocking_forwarder.release.set()
+            await asyncio.wait_for(stop_task, timeout=5.0)
+            await asyncio.wait_for(send_future, timeout=3.0)
+
+            # Only the original submission -- never the one that
+            # arrived during the drain -- ever reached the real
+            # forwarder.
+            self.assertEqual(forwarder.calls, 1)
+        finally:
+            blocking_forwarder.release.set()
+            send_future.cancel()
+            if stop_task is not None and not stop_task.done():
+                stop_task.cancel()
+            try:
+                await asyncio.wait_for(proxy.stop(), timeout=5.0)
+            except Exception:
+                pass
+
+    async def test_shutdown_timeout_leaves_reservation_pending_not_confirmed(self):
+        # Scenario E: if an in-flight forward does not finish within
+        # the configured shutdown-drain deadline (upstream_timeout_
+        # seconds + 5), the proxy must not claim a delivery outcome it
+        # cannot actually confirm. stop() proceeds anyway once the
+        # deadline elapses (and logs a warning) -- the cancelled task
+        # never reaches mark_forwarded/mark_failed/mark_partial, so the
+        # reservation is left exactly as try_reserve_forwarding wrote
+        # it: 'pending', the same documented state as a process crash
+        # mid-send (see the README's "Leases, renewal, and recovering
+        # from a crash" section). A later resubmission after a restart
+        # will see it as in-flight, then abandoned, exactly like that
+        # crash-recovery path.
+        forwarder = AlwaysSucceedsForwarder()
+        blocking_forwarder = BlockingForwarder(forwarder)
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                dry_run=False,
+                upstream_timeout_seconds=1,
+            ),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+            forwarder=blocking_forwarder,
+        )
+        await proxy.start()
+        cache_path = proxy.config.cache_path
+
+        msg = EmailMessage()
+        msg["From"] = "sender@example.com"
+        msg["To"] = "alice@example.com"
+        msg["Message-Id"] = "<shutdown-timeout@example.com>"
+        msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+        msg.set_content("classroom announcement")
+
+        loop = asyncio.get_running_loop()
+        send_future = loop.run_in_executor(
+            None, submit_message, proxy.port, msg, ["alice@example.com"]
+        )
+        try:
+            started = await loop.run_in_executor(None, blocking_forwarder.started.wait, 2.0)
+            self.assertTrue(started, "forward() never started")
+
+            # Deliberately never released within the deadline: stop()
+            # must give up waiting on its own, not hang forever.
+            with self.assertLogs("sl_smtp_proxy.smtp_server", level="WARNING") as captured:
+                await asyncio.wait_for(proxy.stop(), timeout=10.0)
+            self.assertTrue(any("did not finish within" in line for line in captured.output))
+
+            with sqlite3.connect(cache_path) as conn:
+                rows = conn.execute("SELECT status FROM forwarded_messages").fetchall()
+            self.assertEqual([row[0] for row in rows], ["pending"])
+        finally:
+            blocking_forwarder.release.set()
+            send_future.cancel()
+
     async def test_restarting_a_stopped_server_can_still_forward(self):
         # Regression for Codex's finding: stop() permanently shuts down the
         # handler's resolver/forward/dedup thread pools, but the same
@@ -1617,7 +1742,11 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
         )
         await proxy.start()
         await proxy.stop()
+        # Scenario F: a stop() that began shutting down must not leave
+        # the restarted server permanently refusing new work too.
+        self.assertTrue(proxy.handler._shutting_down)
         await proxy.start()
+        self.assertFalse(proxy.handler._shutting_down)
         try:
             msg = EmailMessage()
             msg["From"] = "sender@example.com"
@@ -3466,7 +3595,7 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await proxy.stop()
 
-    async def test_partial_recipient_refusal_returns_temporary_failure_and_records_partial_state(
+    async def test_partial_recipient_refusal_returns_permanent_failure_and_records_partial_state(
         self,
     ):
         # Regression for Codex's finding: smtplib.SMTP.sendmail() can
@@ -3474,10 +3603,12 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
         # the proxy previously ignored that return value entirely and
         # reported complete success. Through a real (not mocked)
         # upstream server that refuses one recipient at RCPT TO time,
-        # the proxy must report a temporary failure describing the
-        # partial outcome, forward only to the accepted recipient, and
-        # record a dedicated "partial" dedup state rather than
-        # "completed" or "failed".
+        # the proxy must report a permanent failure (550) describing
+        # the partial outcome -- not a temporary one, which would
+        # invite an automatic retry; see the ninth review round's fix
+        # -- forward only to the accepted recipient, and record a
+        # dedicated "partial" dedup state rather than "completed" or
+        # "failed".
         upstream_handler = PartiallyRefusingUpstreamHandler({"reply+bob@simplelogin.co"})
         upstream_port = free_port()
         upstream = Controller(

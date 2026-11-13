@@ -353,6 +353,73 @@ otherwise bounds this table's size (see above) -- they are expected to be
 rare, and an operator who resolves one by hand can delete its row
 manually if it needs to be reclaimed.
 
+## Graceful shutdown
+
+`docker stop`, `docker compose down`, and a rolling container replacement
+all send SIGTERM to the proxy's main process. The proxy catches both
+SIGTERM and SIGINT and runs an orderly shutdown rather than relying on
+the process simply being killed -- without this, an in-flight forward
+already accepted by the upstream server could be cut off mid-send with
+no chance to record its outcome, recreating the original incident's
+silent-success problem at shutdown time instead of client-disconnect
+time. A second signal (an impatient double Ctrl-C, or Docker's own
+SIGKILL once `stop_grace_period` elapses) never triggers a second,
+concurrent shutdown -- the signal handler just idempotently marks that
+shutdown was requested, and nothing re-starts it once under way.
+
+Shutdown proceeds in three strict steps, in this order:
+
+1. **Stop accepting new forwarding work.** Every in-progress and future
+   `handle_DATA` call -- a brand-new connection that raced in after
+   shutdown began, or an already-established session (past
+   `EHLO`/`MAIL`/`RCPT`) sending a second message -- is checked right
+   before it would create a forwarding task, however far along it
+   already is in recipient resolution. Once shutdown has begun, it gets
+   a permanent `451` (`"...is shutting down; please retry this message
+   later"`) instead, so a well-behaved client knows to retry once the
+   proxy (or its replacement container) is back. This has to happen
+   *before* the next step, not after: a new submission reaching the
+   forwarding stage in the gap between starting to drain and actually
+   stopping the SMTP controller would create a task the drain never
+   knew to wait for, which `Controller.stop()` would then cancel
+   without ever recording its outcome -- simply closing the listening
+   socket is not enough on its own, since an already-established
+   session could still submit a second message on the same connection.
+2. **Drain in-flight forwards.** Every submission that already created
+   its shielded reservation-claim-and-forward task before step 1 took
+   effect is waited on, same as calling `stop()` directly (see "Delivery-state
+   handling" above) -- up to `UPSTREAM_SMTP_TIMEOUT_SECONDS + 5` seconds
+   (35s at the documented default).
+3. **Tear down.** The worker thread pools and the SMTP controller
+   (and its dedicated event-loop thread) are shut down.
+
+If the drain deadline in step 2 is reached with forwards still
+outstanding, the proxy does not wait any longer: it logs a warning
+naming how many, and proceeds to step 3 anyway. Each such forward's
+dedup reservation is left exactly as it was written when claimed --
+`pending` -- because the cancelled task never reaches
+`mark_forwarded`/`mark_failed`/`mark_partial` to record a real outcome,
+and the proxy will not claim a delivery outcome it cannot actually
+confirm. This is the same documented state, and the same recovery path,
+as a process crash mid-send (see "Leases, renewal, and recovering from a
+crash" above): a resubmission after restart sees it as in-flight, then
+abandoned once the lease expires, and is only reclaimed (accepting the
+same small residual duplicate-delivery risk already documented for that
+path) after the abandoned-reservation grace period. In practice this
+should be rare -- the deadline is already sized to the upstream
+connection's own timeout -- but it is not eliminated, which is why
+`deploy/docker/docker-compose.smtp-proxy.yml` sets
+`stop_grace_period: 45s`, comfortably above that 35s default so Docker's
+own SIGKILL does not arrive before the proxy's orderly drain would have
+finished on its own. If `UPSTREAM_SMTP_TIMEOUT_SECONDS` is raised,
+increase `stop_grace_period` by the same amount.
+
+On a platform where `asyncio`'s signal handling isn't available (POSIX
+only, and only from the main thread of the main interpreter), the proxy
+falls back to blocking indefinitely instead, exactly as it did before
+this feature existed -- an operator in that environment still relies on
+the process being terminated outright.
+
 ## Diagnostics and logging
 
 Each SMTP submission gets a short `correlation_id` that appears on every
@@ -390,6 +457,14 @@ of these terminal audit events -- none of them is ever silently skipped:
   disconnected before a response could be sent, carrying the same
   `correlation_id` as whichever of the above events eventually resolves
   that submission's forwarding attempt.
+- `smtp_message_rejected` (`policy=server_shutting_down`): a submission
+  arrived (or was already in progress) after graceful shutdown began;
+  see "Graceful shutdown" below.
+
+Shutdown itself logs `smtp_proxy_shutdown_signal_received`
+(`signal=SIGTERM`/`SIGINT`), `smtp_proxy_shutdown_started`, and
+`smtp_proxy_shutdown_completed` -- see "Graceful shutdown" below for the
+sequence these bracket.
 
 The `smtp_transform_plan` event also reports timing (`alias_refresh_ms`,
 `resolution_ms`, `transform_validate_ms`) and SimpleLogin API/cache
