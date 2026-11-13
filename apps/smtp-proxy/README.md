@@ -362,10 +362,18 @@ the process simply being killed -- without this, an in-flight forward
 already accepted by the upstream server could be cut off mid-send with
 no chance to record its outcome, recreating the original incident's
 silent-success problem at shutdown time instead of client-disconnect
-time. A second signal (an impatient double Ctrl-C, or Docker's own
-SIGKILL once `stop_grace_period` elapses) never triggers a second,
-concurrent shutdown -- the signal handler just idempotently marks that
-shutdown was requested, and nothing re-starts it once under way.
+time. A second signal (an impatient double Ctrl-C, or a monitoring tool
+re-sending SIGTERM) never triggers a second, concurrent shutdown -- the
+signal handler just idempotently marks that shutdown was requested, and
+nothing re-starts it once under way. The handlers stay installed for
+the *entire* drain-then-stop sequence below, not just until the first
+signal arrives: removing them any earlier would mean that second signal
+falls through to the process's default disposition instead (SIGTERM
+killing the process immediately, SIGINT raising `KeyboardInterrupt` out
+of `asyncio.run`), defeating graceful shutdown for exactly the in-flight
+forward it exists to protect. Only Docker's own SIGKILL, sent once
+`stop_grace_period` elapses, can still end the process outright --
+signals cannot be caught at all once that happens.
 
 Shutdown proceeds in three strict steps, in this order:
 

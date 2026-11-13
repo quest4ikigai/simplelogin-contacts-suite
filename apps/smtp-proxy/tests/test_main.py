@@ -178,6 +178,55 @@ class ProductionShutdownTests(unittest.IsolatedAsyncioTestCase):
             any(payload["event"] == "smtp_message_forwarded" for payload in audit_payloads)
         )
 
+    async def test_second_sigterm_during_drain_does_not_kill_process(self):
+        # Regression for Codex's finding: run_until_shutdown_signal used
+        # to remove its signal handlers as soon as the *first* SIGTERM
+        # was received, before server.stop() (which can take a while
+        # draining) actually ran. A second SIGTERM arriving in that
+        # window -- an impatient double Ctrl-C, or a monitoring tool
+        # re-sending SIGTERM -- would then fall through to the
+        # process's default disposition and terminate the process
+        # immediately, defeating the whole point of graceful shutdown
+        # and leaving the in-flight forward's reservation 'pending'
+        # even though the upstream worker thread might still deliver
+        # it. Handlers must stay installed until stop() itself
+        # completes, so a repeat signal is the documented harmless
+        # no-op instead.
+        loop = asyncio.get_running_loop()
+        msg = _classroom_message()
+
+        send_future = loop.run_in_executor(
+            None,
+            _submit_over_new_connection,
+            self.server.port,
+            msg,
+            ["alice@example.com"],
+        )
+        started = await loop.run_in_executor(None, self.blocking_forwarder.started.wait, 2.0)
+        self.assertTrue(started, "forward() never started")
+
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(0.2)
+        self.assertFalse(self.run_task.done(), "shutdown must still be draining")
+
+        # The second signal, while the drain is still in progress. If
+        # the handler had already been removed, this line would
+        # terminate the entire test process instead of reaching the
+        # assertions below.
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(0.1)
+        self.assertFalse(
+            self.run_task.done(),
+            "a second SIGTERM during the drain must not cut it short",
+        )
+
+        self.blocking_forwarder.release.set()
+        await asyncio.wait_for(self.run_task, timeout=5.0)
+
+        result = await asyncio.wait_for(send_future, timeout=3.0)
+        self.assertEqual(result[0], 250)
+        self.assertEqual(self.blocking_forwarder.inner.calls, 1)
+
     async def test_new_connection_during_shutdown_is_rejected(self):
         # Scenario B: while a forward from an earlier submission is
         # still draining, a brand-new SMTP connection must not be able

@@ -61,22 +61,37 @@ async def run_until_shutdown_signal(server: SmtpProxyServer) -> None:
             await server.serve_forever()
             return
         await shutdown_requested.wait()
+
+        # Handlers stay installed through the whole drain-then-stop
+        # sequence below, not just the wait above: removing them any
+        # earlier would mean a second SIGTERM/SIGINT arriving while
+        # server.stop() is still draining an in-flight forward (an
+        # impatient double Ctrl-C, or a monitoring tool re-sending
+        # SIGTERM) falls through to the process's default disposition
+        # instead -- SIGTERM would kill the process immediately, and
+        # SIGINT would raise KeyboardInterrupt out of asyncio.run --
+        # defeating the whole point of this function and leaving the
+        # reservation 'pending' even though the upstream worker thread
+        # might still go on to deliver the message. _handle_signal
+        # already documents that a repeat signal while shutting down is
+        # meant to be a harmless no-op; that is only true while the
+        # handler is still registered to catch it.
+        LOGGER.info("audit %s", audit_event("smtp_proxy_shutdown_started"))
+        try:
+            await server.stop()
+        except Exception:
+            # Shutting down itself failing must not look like an
+            # ordinary per-message processing error (handle_exception's
+            # smtp_internal_error), and must not prevent the process
+            # from exiting -- Docker (or systemd) forcibly terminates it
+            # once stop_grace_period elapses regardless of what happens
+            # here.
+            LOGGER.exception("Error while shutting down SimpleLogin SMTP proxy")
+        else:
+            LOGGER.info("audit %s", audit_event("smtp_proxy_shutdown_completed"))
     finally:
         for sig in registered_signals:
             loop.remove_signal_handler(sig)
-
-    LOGGER.info("audit %s", audit_event("smtp_proxy_shutdown_started"))
-    try:
-        await server.stop()
-    except Exception:
-        # Shutting down itself failing must not look like an ordinary
-        # per-message processing error (handle_exception's
-        # smtp_internal_error), and must not prevent the process from
-        # exiting -- Docker (or systemd) forcibly terminates it once
-        # stop_grace_period elapses regardless of what happens here.
-        LOGGER.exception("Error while shutting down SimpleLogin SMTP proxy")
-    else:
-        LOGGER.info("audit %s", audit_event("smtp_proxy_shutdown_completed"))
 
 
 async def main() -> None:
