@@ -437,6 +437,23 @@ class AlwaysSucceedsForwarder:
         return ForwardResult(accepted_count=len(list(recipients)), refused_count=0)
 
 
+class LegacyNoneReturningForwarder:
+    """A forwarder implementing the pre-partial-acceptance contract:
+    returns nothing (None) on success, raises on failure. This was the
+    only contract forward() had before the eighth review round added
+    ForwardResult, so any custom forwarder injected via
+    SmtpProxyServer(forwarder=...) and never updated for that change
+    still behaves exactly like this.
+    """
+
+    def __init__(self):
+        self.calls = 0
+
+    def forward(self, sender, recipients, message):
+        self.calls += 1
+        return None
+
+
 class AlwaysPartiallyRefusesForwarder:
     """A forwarder whose forward() always returns a ForwardResult
     reporting one accepted and one refused recipient, for exercising the
@@ -1515,6 +1532,46 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await proxy.stop()
             upstream.stop(no_assert=True)
+
+    async def test_legacy_forwarder_returning_none_is_treated_as_full_success(self):
+        # Regression for Codex's finding: a custom forwarder injected
+        # via SmtpProxyServer(forwarder=...) that still implements the
+        # contract from before the eighth review round's partial-
+        # acceptance fix returns None on success rather than a
+        # ForwardResult. Without normalizing that, result.is_partial
+        # raises AttributeError *after* the message was already
+        # delivered but *before* mark_forwarded ever runs -- the client
+        # gets a generic 451 "internal error" (inviting a retry) and
+        # the dedup reservation is left stuck 'pending'. Once the
+        # abandoned-reservation grace period elapsed, that retry would
+        # silently redeliver an already-accepted message a second time.
+        forwarder = LegacyNoneReturningForwarder()
+        proxy = SmtpProxyServer(
+            local_smtp_config(host="127.0.0.1", port=0, require_auth=False, dry_run=False),
+            reverse_alias_resolver=lambda recipient, alias: "reply+alice@simplelogin.co",
+            forwarder=forwarder,
+        )
+        await proxy.start()
+        cache_path = proxy.config.cache_path
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["Message-Id"] = "<legacy-forwarder@example.com>"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            result = await asyncio.get_running_loop().run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+
+            self.assertEqual(result[0], 250)
+            self.assertEqual(forwarder.calls, 1)
+            with sqlite3.connect(cache_path) as conn:
+                rows = conn.execute("SELECT status FROM forwarded_messages").fetchall()
+            self.assertEqual([row[0] for row in rows], ["completed"])
+        finally:
+            await proxy.stop()
 
     async def test_stop_drains_in_flight_shielded_forward_before_stopping_controller(self):
         # Regression for Codex's finding: aiosmtpd's Controller.stop()

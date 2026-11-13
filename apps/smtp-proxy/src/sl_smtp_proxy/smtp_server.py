@@ -893,6 +893,23 @@ class SmtpProxyHandler:
                 except asyncio.CancelledError:
                     pass
 
+        if result is None:
+            # Backward compatibility: a custom forwarder injected via
+            # SmtpProxyServer(forwarder=...) that still implements the
+            # contract from before the eighth review round's partial-
+            # acceptance fix returns nothing on success (raising only on
+            # failure), not a ForwardResult. Treat that exactly as a
+            # full, unqualified success. Without this, result.is_partial
+            # below would raise AttributeError -- and since that would
+            # happen *after* the forward already succeeded but *before*
+            # mark_forwarded ever runs, the dedup reservation would be
+            # left stuck 'pending' while the client is told to retry:
+            # once the abandoned-reservation grace period elapsed, that
+            # retry would silently redeliver an already-accepted
+            # message a second time, the exact failure mode this whole
+            # feature exists to prevent.
+            result = ForwardResult(accepted_count=len(recipients), refused_count=0)
+
         forward_duration_ms = int((time.monotonic() - started) * 1000)
         if result.is_partial:
             # The upstream server confirmed-accepted some recipients and
