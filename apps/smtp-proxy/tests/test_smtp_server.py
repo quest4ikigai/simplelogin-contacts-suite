@@ -2716,6 +2716,84 @@ class SmtpServerTests(unittest.IsolatedAsyncioTestCase):
             await proxy.stop()
             upstream.stop(no_assert=True)
 
+    async def test_excess_concurrent_submissions_are_rejected_at_capacity(self):
+        # Security review finding: resolver_max_workers/forward_max_workers
+        # only bound how many worker threads are *actively* running --
+        # run_in_executor's own queue is unbounded, so without a separate
+        # admission limit, a client opening enough concurrent sessions and
+        # sending near-max-size messages while workers are busy (e.g. with
+        # many uncached recipients) could have unboundedly many
+        # submissions each holding their own parsed/transformed message in
+        # memory while waiting for a free worker -- unbounded memory
+        # growth. max_concurrent_submissions bounds how many submissions
+        # can be inside handle_DATA at once; excess ones are rejected
+        # immediately with a temporary failure, before any parsing or
+        # resolution work, rather than being accepted and left queued.
+        blocking_resolver = BlockingResolver()
+        proxy = SmtpProxyServer(
+            local_smtp_config(
+                host="127.0.0.1",
+                port=0,
+                require_auth=False,
+                max_concurrent_submissions=2,
+            ),
+            reverse_alias_resolver=blocking_resolver,
+        )
+        await proxy.start()
+        try:
+            msg = EmailMessage()
+            msg["From"] = "sender@example.com"
+            msg["To"] = "alice@example.com"
+            msg["X-SimpleLogin-Alias"] = "shopping@example.com"
+            msg.set_content("classroom announcement")
+
+            loop = asyncio.get_running_loop()
+            first_send = loop.run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+            second_send = loop.run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+
+            started = await loop.run_in_executor(None, blocking_resolver.started.wait, 2.0)
+            self.assertTrue(started, "resolver never started")
+            # Give the second submission time to also reach (and block
+            # in) resolution, so both of the two available slots are
+            # genuinely occupied before the next assertion.
+            await asyncio.sleep(0.3)
+
+            # A third submission, with both slots occupied, must be
+            # rejected immediately -- it must never even reach the
+            # (deliberately blocked) resolver.
+            third_result = await loop.run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+            self.assertEqual(third_result[0], 451)
+            self.assertIn("capacity", third_result[1].lower())
+
+            blocking_resolver.release.set()
+            first_result = await asyncio.wait_for(first_send, timeout=5.0)
+            second_result = await asyncio.wait_for(second_send, timeout=5.0)
+            # Both of the original two did genuinely reach resolution
+            # (and therefore occupied a slot) -- dry_run is the default,
+            # so they are rejected only *after* resolving successfully.
+            self.assertEqual(first_result[0], 550)
+            self.assertIn("dry-run", first_result[1])
+            self.assertEqual(second_result[0], 550)
+            self.assertIn("dry-run", second_result[1])
+
+            # Capacity freed up again once both finished: a fresh
+            # submission must succeed (reach the same dry-run rejection)
+            # rather than being turned away.
+            fourth_result = await loop.run_in_executor(
+                None, submit_message, proxy.port, msg, ["alice@example.com"]
+            )
+            self.assertEqual(fourth_result[0], 550)
+            self.assertIn("dry-run", fourth_result[1])
+        finally:
+            blocking_resolver.release.set()
+            await proxy.stop()
+
     async def test_server_remains_responsive_while_recipient_resolution_is_blocked(self):
         blocking_resolver = BlockingResolver()
         proxy = SmtpProxyServer(

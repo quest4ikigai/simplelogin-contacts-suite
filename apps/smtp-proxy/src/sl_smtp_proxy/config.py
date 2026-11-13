@@ -103,6 +103,19 @@ class SmtpProxyConfig:
 
     resolver_max_workers: int = 4
     forward_max_workers: int = 4
+    # Bounds how many submissions can be in handle_DATA at once (parsed,
+    # resolving, transforming, or forwarding), independent of
+    # resolver_max_workers/forward_max_workers: those only bound how many
+    # worker threads are *actively* running, not how many submissions can
+    # be queued waiting for one while each holds its own (up to
+    # max_message_bytes) parsed/transformed message in memory on the
+    # event loop. Without this, a client (or many) opening enough
+    # concurrent sessions and sending near-max-size messages while
+    # resolver workers are busy (e.g. with uncached recipients) can grow
+    # memory usage without bound. Excess submissions are rejected
+    # immediately with a temporary failure instead of being accepted and
+    # left waiting.
+    max_concurrent_submissions: int = 20
     duplicate_suppression_window_seconds: int = 86400
     duplicate_reservation_lease_seconds: int = 60
     duplicate_reservation_abandoned_grace_seconds: int = 300
@@ -174,6 +187,7 @@ def load_config_from_env() -> SmtpProxyConfig:
         cache_contact_ttl_seconds=env_int("CACHE_CONTACT_TTL_SECONDS", 86400),
         resolver_max_workers=env_int("SMTP_PROXY_RESOLVER_MAX_WORKERS", 4),
         forward_max_workers=env_int("SMTP_PROXY_FORWARD_MAX_WORKERS", 4),
+        max_concurrent_submissions=env_int("SMTP_PROXY_MAX_CONCURRENT_SUBMISSIONS", 20),
         duplicate_suppression_window_seconds=env_int(
             "SMTP_PROXY_DUPLICATE_SUPPRESSION_WINDOW_SECONDS", 86400
         ),

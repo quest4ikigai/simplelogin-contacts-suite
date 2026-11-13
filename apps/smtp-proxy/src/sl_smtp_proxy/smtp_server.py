@@ -81,6 +81,9 @@ def _forward_fingerprint(sender: str, recipients: Sequence[str], message: Messag
 _SHUTTING_DOWN_RESPONSE = (
     "451 SimpleLogin SMTP proxy is shutting down; please retry this message later"
 )
+_AT_CAPACITY_RESPONSE = (
+    "451 SimpleLogin SMTP proxy is at capacity; please retry this message later"
+)
 
 
 def _swallow_task_exception(task: "asyncio.Task") -> None:
@@ -190,6 +193,11 @@ class SmtpProxyHandler:
         # Like _pending_forward_tasks, only ever read or written from
         # the aiosmtpd controller's own event loop thread.
         self._shutting_down = False
+        # How many submissions are currently inside handle_DATA (parsed,
+        # resolving, transforming, or forwarding) -- see
+        # config.max_concurrent_submissions. Reset here for the same
+        # restart reason as _shutting_down above.
+        self._in_flight_submissions = 0
 
     def reopen(self) -> None:
         """Recreate the worker pools if a previous close() shut them down.
@@ -293,6 +301,20 @@ class SmtpProxyHandler:
         )
         return _SHUTTING_DOWN_RESPONSE
 
+    def _reject_for_capacity(self, peer: str, correlation_id: str) -> str:
+        LOGGER.info(
+            "audit %s",
+            audit_event(
+                "smtp_message_rejected",
+                peer=peer,
+                correlation_id=correlation_id,
+                policy="at_capacity",
+                reason="SimpleLogin SMTP proxy is at capacity",
+                in_flight_submissions=self._in_flight_submissions,
+            ),
+        )
+        return _AT_CAPACITY_RESPONSE
+
     async def handle_MAIL(self, server, session, envelope, address, mail_options) -> str:
         if not _sender_allowed(self.config, address):
             LOGGER.info(
@@ -320,6 +342,25 @@ class SmtpProxyHandler:
             # guarantees no untracked task is created once a shutdown's
             # drain has started.
             return self._reject_for_shutdown(peer, correlation_id)
+        if self._in_flight_submissions >= self.config.max_concurrent_submissions:
+            # Rejected before any parsing/resolution work, not merely
+            # queued behind it: resolver_max_workers/forward_max_workers
+            # only bound how many worker threads are *actively* running,
+            # not how many submissions can be waiting for one while each
+            # holds its own (up to max_message_bytes) parsed/transformed
+            # message in memory on the event loop. Without this cap, a
+            # client opening enough concurrent sessions and sending
+            # near-max-size messages while workers are busy (e.g. with
+            # many uncached recipients) could grow memory usage without
+            # bound.
+            return self._reject_for_capacity(peer, correlation_id)
+        self._in_flight_submissions += 1
+        try:
+            return await self._process_data(correlation_id, peer, envelope)
+        finally:
+            self._in_flight_submissions -= 1
+
+    async def _process_data(self, correlation_id: str, peer: str, envelope) -> str:
         loop = asyncio.get_running_loop()
         started = time.monotonic()
         phase = "parsing"

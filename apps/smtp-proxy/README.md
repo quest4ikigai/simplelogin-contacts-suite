@@ -102,6 +102,7 @@ Relevant settings:
 ```dotenv
 SMTP_PROXY_RESOLVER_MAX_WORKERS=4
 SMTP_PROXY_FORWARD_MAX_WORKERS=4
+SMTP_PROXY_MAX_CONCURRENT_SUBMISSIONS=20
 ```
 
 `SMTP_PROXY_RESOLVER_MAX_WORKERS` bounds how many messages can have their
@@ -109,6 +110,25 @@ recipient resolution in flight against the SimpleLogin API at once.
 `SMTP_PROXY_FORWARD_MAX_WORKERS` bounds concurrent upstream SMTP forwarding.
 Both default to 4 and exist to cap thread/connection growth under concurrent
 load rather than to tune for a specific throughput target.
+
+`SMTP_PROXY_MAX_CONCURRENT_SUBMISSIONS` is a separate, broader limit: how
+many submissions can be inside message processing at all (parsed,
+resolving, transforming, or forwarding) at once, regardless of which
+worker pool they currently need. The two worker-pool settings above only
+bound how many threads are *actively* running -- `run_in_executor`'s own
+queue is unbounded, so without this separate admission limit, a client
+opening enough concurrent sessions and submitting messages up to
+`SMTP_PROXY_MAX_MESSAGE_BYTES` each while the worker pools are busy (for
+example with many uncached recipients) could have unboundedly many
+submissions each holding their own parsed/transformed copy of their
+message in memory while waiting for a free worker -- unbounded memory
+growth with a correspondingly reachable path to exhausting the process.
+A submission beyond this limit is rejected immediately with a temporary
+`451`, before any parsing or resolution work, rather than being accepted
+and left queued; a well-behaved client retries it once capacity frees up.
+Raise it if legitimate concurrent load routinely hits the default of 20;
+lower it (or lower `SMTP_PROXY_MAX_MESSAGE_BYTES`) to trade throughput for
+a smaller worst-case memory ceiling.
 
 The duplicate-suppression cache (below) gets its own small, fixed-size
 worker pool for the same reason resolution and forwarding do: SQLite can
@@ -468,6 +488,9 @@ of these terminal audit events -- none of them is ever silently skipped:
 - `smtp_message_rejected` (`policy=server_shutting_down`): a submission
   arrived (or was already in progress) after graceful shutdown began;
   see "Graceful shutdown" below.
+- `smtp_message_rejected` (`policy=at_capacity`): `SMTP_PROXY_MAX_CONCURRENT_SUBMISSIONS`
+  was already reached; carries `in_flight_submissions` (a count, never
+  addresses). See "Bulk recipients and concurrency" above.
 
 Shutdown itself logs `smtp_proxy_shutdown_signal_received`
 (`signal=SIGTERM`/`SIGINT`), `smtp_proxy_shutdown_started`, and
